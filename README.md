@@ -1,4 +1,21 @@
-This repository contains the official implementation of DyGEnc (Dynamic Graph Encoding), a method for structured spatio-temporal reasoning in dynamic environments using sequences of textual scene graphs and large language models (LLMs).
+This repository extends the [upstream DyGEnc implementation](https://github.com/linukc/DyGEnc)
+with RAM-only school-server jobs and resumable AGQA training. The original model
+is DyGEnc (Dynamic Graph Encoding), a method for structured spatio-temporal
+reasoning using sequences of textual scene graphs and large language models.
+
+## Kaggle source setup
+
+Import [the Kaggle clone notebook](notebooks/kaggle_clone.ipynb) to clone the
+`kaggle-ram-v1` version from `tdat1465/DyGEnc`. This is a source-setup cell, not a
+complete Kaggle training notebook; the current runner still requires native BF16.
+
+## RAM-only school-server jobs
+
+See [the Slurm guide](scripts/slurm/README.md) for fresh/resume AGQA jobs that keep
+the Python environment, downloaded data, preprocessing outputs and pretrained
+model caches in executable tmpfs. Only checkpoints and small logs/metadata stay
+on disk. These jobs use the separate resumable `src.server_train` runner, not the
+legacy `train.py` below.
 
 ## Installation
 

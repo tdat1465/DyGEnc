@@ -1,4 +1,5 @@
 import contextlib
+import os
 
 import torch
 import torch.nn as nn
@@ -37,7 +38,7 @@ class DGMap3d(torch.nn.Module):
         kwargs = {
             "max_memory": {0: '80GiB'},
             "device_map": "cuda",
-            "revision": "main",
+            "revision": os.environ.get("DYGENC_LLM_REVISION", "main"),
         }
 
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -347,3 +348,7 @@ class DGMap3d(torch.nn.Module):
                 trainable_params += num_params
 
         return trainable_params, all_param
+
+
+# Public name used by train.py, predict.py, and the RAM-only server runner.
+DyGEnc = DGMap3d

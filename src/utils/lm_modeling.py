@@ -1,3 +1,5 @@
+import os
+
 import torch
 from torch import nn
 from loguru import logger
@@ -28,10 +30,10 @@ class Dataset(torch.utils.data.Dataset):
 
 
 class Sentence_Transformer(nn.Module):
-    def __init__(self, pretrained_repo):
+    def __init__(self, pretrained_repo, revision="main"):
         super(Sentence_Transformer, self).__init__()
         logger.info(f"inherit model weights from {pretrained_repo}")
-        self.bert_model = AutoModel.from_pretrained(pretrained_repo)
+        self.bert_model = AutoModel.from_pretrained(pretrained_repo, revision=revision)
 
     def mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output[0]  # First element of model_output contains all token embeddings
@@ -49,8 +51,9 @@ class Sentence_Transformer(nn.Module):
 
 def load_mbert():
     pretrained_repo = 'answerdotai/ModernBERT-large'
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_repo)
-    model = Sentence_Transformer(pretrained_repo)
+    revision = os.environ.get("DYGENC_MBERT_REVISION", "main")
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_repo, revision=revision)
+    model = Sentence_Transformer(pretrained_repo, revision=revision)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -66,7 +69,10 @@ def mbert_text2embedding(model, tokenizer, device, text):
     dataset = Dataset(input_ids=encoding.input_ids, attention_mask=encoding.attention_mask)
 
     # DataLoader
-    dataloader = DataLoader(dataset, batch_size=1024, shuffle=False)
+    batch_size = int(os.environ.get("DYGENC_EMBED_BATCH_SIZE", "1024"))
+    if batch_size < 1:
+        raise ValueError("DYGENC_EMBED_BATCH_SIZE must be positive")
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     # Placeholder for storing the embeddings
     all_embeddings = []
     # Iterate through batches
@@ -78,7 +84,8 @@ def mbert_text2embedding(model, tokenizer, device, text):
             # Forward pass
             embeddings = model(input_ids=batch["input_ids"], att_mask=batch["att_mask"])
             # Append the embeddings to the list
-            all_embeddings.append(embeddings)
+            # Keep completed batches on host RAM, not on scarce GPU VRAM.
+            all_embeddings.append(embeddings.cpu())
 
     # Concatenate the embeddings from all batches
     all_embeddings = torch.cat(all_embeddings, dim=0).cpu()

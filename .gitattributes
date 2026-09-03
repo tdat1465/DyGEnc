@@ -1,0 +1,5 @@
+# Slurm/Bash reject CRLF on Linux even when the checkout was edited on Windows.
+*.sh text eol=lf
+*.slurm text eol=lf
+*.py text eol=lf
+*.txt text eol=lf

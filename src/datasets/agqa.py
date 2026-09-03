@@ -1,6 +1,7 @@
 import os
 import json
 import warnings
+from collections import OrderedDict
 warnings.filterwarnings("ignore", "You are using `torch.load` with `weights_only=False`*.")
 
 import torch
@@ -33,7 +34,23 @@ class AGQADataset(Dataset):
             self.load_idx = [idx for idx, item in enumerate(self.qa2sg) if 0 < len(item) <= seq_limit]
         logger.warning(f"For thresh={seq_limit}: num seqs={len(self.load_idx)}/{len(self.qa2sg)}")
         qa_data_path = f"{self.root_path}/data/AGQA_balanced/{self.split}_balanced.txt"
-        self.qa_data = list(json.load(open(qa_data_path, mode='r', encoding='utf8')).values())
+        with open(qa_data_path, mode='r', encoding='utf8') as file:
+            self.qa_data = list(json.load(file).values())
+
+        self.graph_dir = f"{self.root_path}/preprocessed_{lm_model}/{self.split}/graphs"
+        self.desc_dir = f"{self.root_path}/preprocessed_{lm_model}/{self.split}/descs"
+        self.lazy_graphs = os.environ.get("DYGENC_LAZY_GRAPHS", "0") == "1"
+        self.video_cache = OrderedDict()
+        self.video_cache_size = int(os.environ.get("DYGENC_GRAPH_CACHE_SIZE", "2"))
+        if self.video_cache_size < 1:
+            raise ValueError("DYGENC_GRAPH_CACHE_SIZE must be positive")
+        if self.lazy_graphs:
+            # The RAM-only Slurm job already keeps these files in tmpfs. A
+            # bounded cache avoids duplicating ALL graph tensors in the heap.
+            if not os.path.isdir(self.graph_dir) or not os.path.isdir(self.desc_dir):
+                raise FileNotFoundError("Missing preprocessed graph/description directories")
+            logger.info(f"Loading graphs on demand; cache={self.video_cache_size} videos")
+            return
 
         logger.info(f"Loading graphs")
         self.graphs = {file.split(".")[0]: 
@@ -50,12 +67,29 @@ class AGQADataset(Dataset):
     def __len__(self):
         return len(self.load_idx)
 
+    def _load_video(self, video_id):
+        if not self.lazy_graphs:
+            return self.graphs[video_id], self.descs[video_id]
+        if video_id in self.video_cache:
+            self.video_cache.move_to_end(video_id)
+            return self.video_cache[video_id]
+        if not isinstance(video_id, str) or not video_id or any(c in video_id for c in ("/", "\\")) or video_id in (".", ".."):
+            raise ValueError(f"Invalid AGQA video ID: {video_id!r}")
+        graphs = torch.load(os.path.join(self.graph_dir, f"{video_id}.pt"), weights_only=False)
+        with open(os.path.join(self.desc_dir, f"{video_id}.pkl"), "rb") as file:
+            descs = pickle.load(file)
+        self.video_cache[video_id] = graphs, descs
+        if len(self.video_cache) > self.video_cache_size:
+            self.video_cache.popitem(last=False)
+        return graphs, descs
+
     def __getitem__(self, index):
         item = self.qa_data[self.load_idx[index]]
-        graphs = [g for r, g in self.graphs[item["video_id"]].items() if r in self.qa2sg[self.load_idx[index]]]
-        descs = [d for r, d in self.descs[item["video_id"]].items() if r in self.qa2sg[self.load_idx[index]]]
+        video_graphs, video_descs = self._load_video(item["video_id"])
+        graphs = [g for r, g in video_graphs.items() if r in self.qa2sg[self.load_idx[index]]]
+        descs = [d for r, d in video_descs.items() if r in self.qa2sg[self.load_idx[index]]]
 
-        orig_idxs = [int(r[0]) for r, g in self.graphs[item["video_id"]].items() if r in self.qa2sg[self.load_idx[index]]]
+        orig_idxs = [int(r[0]) for r, g in video_graphs.items() if r in self.qa2sg[self.load_idx[index]]]
         assert len(orig_idxs) == len(graphs)
         assert len(graphs) != 0
 

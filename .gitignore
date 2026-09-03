@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+.venv/
+.test-venv/
+logs/
+runs/
+weights/
+eval/
+wandb/
+.pytest_cache/
+
+# Credentials and local configuration must never be published.
+.env
+.env.*
+!.env.example
+secrets/
+kaggle.json
+hf_token
+*.pem
+*.key
+
+# Generated datasets, downloaded models, caches and checkpoints.
+.cache/
+agqa/
+preprocessed_*/
+checkpoints/
+*.pth
+*.pt
+*.safetensors
+*.zip

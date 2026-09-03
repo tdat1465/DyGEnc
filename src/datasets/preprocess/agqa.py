@@ -13,12 +13,13 @@ from torch_geometric.utils.convert import from_networkx
 from torch_geometric.transforms import AddLaplacianEigenvectorPE
 
 from src.utils.lm_modeling import load_model, load_text2embedding
+from src.utils.seed import set_seed
 
 
 root_path = os.environ["AGQA_ROOT"]
 LPE_NUM = 4
 logger.info(f"Setting lpe={LPE_NUM}")
-with open(spj(root_path, "data", "ENG.txt"), "rt") as file:
+with open(spj(root_path, "data", "ENG.txt"), "rt", encoding="utf-8-sig") as file:
     MAPPING = json.load(file)
 ### load embed model
 MODEL_NAME = "mbert"
@@ -26,7 +27,8 @@ logger.info(f"Loading LM={MODEL_NAME}")
 model, tokenizer, device = load_model[MODEL_NAME]()
 logger.info(device)
 text2embedding = load_text2embedding[MODEL_NAME]
-SG_GLOBAL = dict() # contain in RAM low num of graphs to save i/o bound
+SG_GLOBAL = dict() # Only interval keys are needed later for QA grounding.
+SAVE_NETWORKX = os.environ.get("DYGENC_SAVE_NETWORKX", "1") == "1"
 
 
 def textualize_graph(nx_graph):
@@ -61,7 +63,7 @@ def load_grounding_frames(grounding_item):
 
 def parse_sg_keys(sg_item):
     seq = []
-    frames = sorted([i for i in sg_item.keys() if i.startswith('0')], key=lambda x: int(x[-6:].lstrip('0')))
+    frames = sorted([i for i in sg_item.keys() if i.startswith('0')], key=lambda x: int(x[-6:]))
     for key_frame in frames:
         relevante_keys = [key for key in sg_item.keys() if key.endswith(key_frame)]
 
@@ -75,10 +77,12 @@ def parse_sg_keys(sg_item):
         for entity_key in [key for key in relevante_keys
                 if (key.startswith('r') or key.startswith('v'))]:
             object_set.update([item["class"] for item in sg_item[entity_key]["objects"]])
-        sg_object_mapping = {o_class: idx for idx, o_class in enumerate(list(object_set))}
+        # Stable node ordering when data is rebuilt on another job/node.
+        objects = sorted(object_set)
+        sg_object_mapping = {o_class: idx for idx, o_class in enumerate(objects)}
 
         # add nodes
-        for obj in object_set:
+        for obj in objects:
             G.add_node(sg_object_mapping[obj], label=MAPPING[obj])
         # add edges
         for entity_key in [key for key in relevante_keys
@@ -98,7 +102,8 @@ def preprocess_graphs():
     for split in ["train", "test"]:
         os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/{split}", exist_ok=True)
         os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/graphs/", exist_ok=True)
-        os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/graphs_networkx/", exist_ok=True)
+        if SAVE_NETWORKX:
+            os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/graphs_networkx/", exist_ok=True)
         os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/descs", exist_ok=True)
 
         # iterate over splits
@@ -109,8 +114,9 @@ def preprocess_graphs():
         for sg_name, sg_item in tqdm(sg_data.items()):
             sg_seq_nx, seq_frame_names = parse_sg_keys(sg_item)
             assert len(sg_seq_nx) > 0
-            with open(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/graphs_networkx/{sg_name}.pkl", "wb") as f:
-                pickle.dump(sg_seq_nx, f)
+            if SAVE_NETWORKX:
+                with open(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/graphs_networkx/{sg_name}.pkl", "wb") as f:
+                    pickle.dump(sg_seq_nx, f)
             
             # leave only unique graphs and save indices
             uniq_start_index = None
@@ -187,7 +193,9 @@ def preprocess_graphs():
             assert node_idx_start == len(node_embed)
             assert edge_idx_start == len(edge_embed)
 
-            SG_GLOBAL[sg_name] = all_pyg_graphs
+            # Do not retain a second full copy of every graph tensor in process
+            # RAM when the serialized graphs already occupy tmpfs RAM.
+            SG_GLOBAL[sg_name] = tuple(all_pyg_graphs)
             torch.save(all_pyg_graphs, f"{root_path}/preprocessed_{MODEL_NAME}/{split}/graphs/{sg_name}.pt")
             with open(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/descs/{sg_name}.pkl", "wb") as f:
                 pickle.dump(description, f)
@@ -199,16 +207,16 @@ def preprocess_qa():
 
         logger.info(f"Loading QA")
         qa_data_path = f"{root_path}/data/AGQA_balanced/{split}_balanced.txt"
-        qa_json = json.load(open(qa_data_path, mode='r', encoding='utf8'))
+        with open(qa_data_path, mode='r', encoding='utf8') as file:
+            qa_json = json.load(file)
 
         for qa_key, qa_item in tqdm(qa_json.items()):
-            seq_graph = SG_GLOBAL[qa_item['video_id']]
+            all_ranges = SG_GLOBAL[qa_item['video_id']]
 
             grounding_idx = sorted(load_grounding_frames(qa_item["sg_grounding"]),
-                key=lambda x: int(x[-6:].lstrip('0')))
+                key=lambda x: int(x[-6:]))
             unique_g_idx = list()
             if grounding_idx:
-                all_ranges = list(seq_graph.keys())
                 for key_range in all_ranges:
                     for d_idx in grounding_idx:
                         if int(d_idx.lstrip()) in range(int(key_range[0].lstrip()), int(key_range[1].lstrip())):
@@ -218,7 +226,7 @@ def preprocess_qa():
                     unique_g_idx.append(all_ranges[-1])
             else:
                 # quite often
-                unique_g_idx = [key_range for key_range in list(seq_graph.keys())]
+                unique_g_idx = list(all_ranges)
 
             QA2SQ[qa_key] = sorted(unique_g_idx, key=lambda x: int(x[0]))
             assert len(QA2SQ[qa_key]) > 0
@@ -227,6 +235,7 @@ def preprocess_qa():
             pickle.dump(QA2SQ, f)
 
 if __name__ == "__main__":
+    set_seed(int(os.environ.get("DYGENC_PREPROCESS_SEED", "18")))
     # iterate over graphs and embed all keyframes
     # for AGQA (2M QA >> 10K SG) it is efficient
     preprocess_graphs()
