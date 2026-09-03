@@ -10,6 +10,8 @@ from tqdm import tqdm
 from loguru import logger
 from torch.utils.data import Dataset
 
+from src.datasets.agqa_storage import INDEX_NAME, IndexedQA
+
 
 class AGQADataset(Dataset):
     # tested only for the AGQA2.0
@@ -20,22 +22,33 @@ class AGQADataset(Dataset):
         self.split = split
         assert split in ["train", "test"]
 
-        logger.info(f"Loading QA grounding")
-        qa2sg_data_path = \
-            f"{self.root_path}/preprocessed_{lm_model}/{self.split}/qa2sg.pkl"
-        with open(qa2sg_data_path, "rb") as file:
-            self.qa2sg = list(pickle.load(file).values())
-        logger.info(f"G len {len(self.qa2sg)}")
-
-        logger.info(f"Loading QA")
-        if seq_limit == float('inf'):
-            self.load_idx = list(range(len(self.qa2sg)))
+        self.indexed_qa = os.environ.get("DYGENC_INDEXED_QA", "0") == "1"
+        if self.indexed_qa:
+            index_path = os.path.join(self.root_path, f"preprocessed_{lm_model}", split, INDEX_NAME)
+            self.qa_index = IndexedQA(index_path, seq_limit=seq_limit)
+            logger.info(f"Indexed QA, thresh={seq_limit}: {len(self.qa_index)}/{self.qa_index.total_count}")
         else:
-            self.load_idx = [idx for idx, item in enumerate(self.qa2sg) if 0 < len(item) <= seq_limit]
-        logger.warning(f"For thresh={seq_limit}: num seqs={len(self.load_idx)}/{len(self.qa2sg)}")
-        qa_data_path = f"{self.root_path}/data/AGQA_balanced/{self.split}_balanced.txt"
-        with open(qa_data_path, mode='r', encoding='utf8') as file:
-            self.qa_data = list(json.load(file).values())
+            logger.info("Loading QA grounding")
+            qa2sg_data_path = \
+                f"{self.root_path}/preprocessed_{lm_model}/{self.split}/qa2sg.pkl"
+            with open(qa2sg_data_path, "rb") as file:
+                grounding = pickle.load(file)
+            logger.info("Loading QA")
+            qa_data_path = f"{self.root_path}/data/AGQA_balanced/{self.split}_balanced.txt"
+            with open(qa_data_path, mode='r', encoding='utf8') as file:
+                qa_data = json.load(file)
+            if qa_data.keys() != grounding.keys():
+                raise ValueError("AGQA QA IDs and grounding IDs do not match; rebuild preprocessing")
+            # Align by explicit QA ID, not separate dict.values() order. The
+            # standard artifacts have identical order; this also detects stale
+            # or shuffled grounding without returning a different question's SG.
+            self.qa_data = list(qa_data.values())
+            self.qa2sg = [grounding[qa_id] for qa_id in qa_data]
+            if seq_limit == float('inf'):
+                self.load_idx = range(len(self.qa2sg))
+            else:
+                self.load_idx = [idx for idx, item in enumerate(self.qa2sg) if 0 < len(item) <= seq_limit]
+            logger.warning(f"For thresh={seq_limit}: num seqs={len(self.load_idx)}/{len(self.qa2sg)}")
 
         self.graph_dir = f"{self.root_path}/preprocessed_{lm_model}/{self.split}/graphs"
         self.desc_dir = f"{self.root_path}/preprocessed_{lm_model}/{self.split}/descs"
@@ -65,7 +78,7 @@ class AGQADataset(Dataset):
                 self.descs[file.split(".")[0]] = pickle.load(f)
 
     def __len__(self):
-        return len(self.load_idx)
+        return len(self.qa_index) if self.indexed_qa else len(self.load_idx)
 
     def _load_video(self, video_id):
         if not self.lazy_graphs:
@@ -84,12 +97,17 @@ class AGQADataset(Dataset):
         return graphs, descs
 
     def __getitem__(self, index):
-        item = self.qa_data[self.load_idx[index]]
+        if self.indexed_qa:
+            _, item, grounding = self.qa_index[index]
+        else:
+            source_index = self.load_idx[index]
+            item = self.qa_data[source_index]
+            grounding = self.qa2sg[source_index]
         video_graphs, video_descs = self._load_video(item["video_id"])
-        graphs = [g for r, g in video_graphs.items() if r in self.qa2sg[self.load_idx[index]]]
-        descs = [d for r, d in video_descs.items() if r in self.qa2sg[self.load_idx[index]]]
+        graphs = [g for r, g in video_graphs.items() if r in grounding]
+        descs = [d for r, d in video_descs.items() if r in grounding]
 
-        orig_idxs = [int(r[0]) for r, g in video_graphs.items() if r in self.qa2sg[self.load_idx[index]]]
+        orig_idxs = [int(r[0]) for r, g in video_graphs.items() if r in grounding]
         assert len(orig_idxs) == len(graphs)
         assert len(graphs) != 0
 

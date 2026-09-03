@@ -16,15 +16,22 @@ esac
 PERSIST_ROOT="${PERSIST_ROOT:-/media02/lnthanh03}"
 SOURCE_REPO="${SOURCE_REPO:-${SLURM_SUBMIT_DIR:-$PERSIST_ROOT/code/DyGEnc}}"
 RUN_DIR="${RUN_DIR:-$PERSIST_ROOT/runs/dygenc/agqa_full}"
-KAGGLE_JSON="${KAGGLE_JSON:-$PERSIST_ROOT/secrets/kaggle.json}"
 HF_TOKEN_FILE="${HF_TOKEN_FILE:-$PERSIST_ROOT/secrets/hf_token}"
-KAGGLE_DATASET="${KAGGLE_DATASET:-tdat1465/agqa-balanced}"
+DATASET_REPO="${DATASET_REPO:-tdat1465/agqa-balanced}"
+DATASET_REVISION="${DATASET_REVISION:-}"
 ENG_FILE="${ENG_FILE:-}"
 ENG_URL="${ENG_URL:-}"
 if [[ -z "$ENG_FILE" && -z "$ENG_URL" && -f "$PERSIST_ROOT/secrets/ENG.txt" ]]; then
   ENG_FILE="$PERSIST_ROOT/secrets/ENG.txt"
 fi
-TARGET_EPOCHS="${TARGET_EPOCHS:-1}"
+if [[ -z "$ENG_FILE" && -z "$ENG_URL" ]]; then
+  ENG_URL='https://drive.google.com/uc?export=download&id=1d0Gx4x5qnvp13Su_sIS_nlSn47ZggY8n'
+fi
+TARGET_EPOCHS="${TARGET_EPOCHS:-5}"
+TRAIN_PROFILE="${TRAIN_PROFILE:-full}"
+ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-32}"
+LOSS_REDUCTION="${LOSS_REDUCTION:-token_mean}"
+STOP_AFTER_UPDATES="${STOP_AFTER_UPDATES:-0}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-1000}"
 SEED="${SEED:-18}"
 MIN_RAM_FREE_GB="${MIN_RAM_FREE_GB:-40}"
@@ -40,16 +47,19 @@ MBERT_MODEL="answerdotai/ModernBERT-large"
 LLM_REVISION="${LLM_REVISION:-}"
 MBERT_REVISION="${MBERT_REVISION:-}"
 
-for name in TARGET_EPOCHS CHECKPOINT_EVERY MIN_RAM_FREE_GB MIN_TRAIN_HEADROOM_GB DYGENC_EMBED_BATCH_SIZE DYGENC_GRAPH_CACHE_SIZE; do
+for name in TARGET_EPOCHS ACCUMULATION_STEPS CHECKPOINT_EVERY MIN_RAM_FREE_GB MIN_TRAIN_HEADROOM_GB DYGENC_EMBED_BATCH_SIZE DYGENC_GRAPH_CACHE_SIZE; do
   positive_integer "${!name}" || die "$name must be a positive integer"
 done
+[[ "$TRAIN_PROFILE" == full || "$TRAIN_PROFILE" == upstream ]] || die "TRAIN_PROFILE must be full or upstream"
+[[ "$LOSS_REDUCTION" == token_mean || "$LOSS_REDUCTION" == sample_mean ]] || die "LOSS_REDUCTION must be token_mean or sample_mean"
+[[ "$STOP_AFTER_UPDATES" =~ ^[0-9]+$ ]] || die "STOP_AFTER_UPDATES must be a non-negative integer"
 [[ "$SEED" =~ ^[0-9]+$ ]] || die "SEED must be a non-negative integer"
 [[ -z "$ENG_URL" || -z "$ENG_FILE" ]] || die "Set ENG_URL or ENG_FILE, not both"
 for cmd in flock findmnt readlink stat mktemp setsid tar; do
   command -v "$cmd" >/dev/null 2>&1 || die "Required system command is missing: $cmd"
 done
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "Python executable missing: $PYTHON_BIN"
-for file in requirements-server.txt src/server_train.py scripts/slurm/stage_agqa.py; do
+for file in requirements-server.txt src/server_train.py scripts/slurm/stage_agqa.py scripts/slurm/download_agqa.py; do
   [[ -f "$SOURCE_REPO/$file" ]] || die "Current DyGEnc source file missing: $SOURCE_REPO/$file"
 done
 SOURCE_REPO="$(readlink -f -- "$SOURCE_REPO")"
@@ -69,17 +79,17 @@ if [[ "$RUN_MODE" == fresh ]]; then
     [[ ! -e "$RUN_DIR/$file" && ! -L "$RUN_DIR/$file" ]] || die "$RUN_DIR/$file exists: submit resume or choose a NEW RUN_DIR"
   done
 else
-  for file in last.pth source-fingerprint.sha256 model-revisions.json raw-data-manifest.json; do
+  for file in last.pth source-fingerprint.sha256 model-revisions.json dataset-source.json raw-data-manifest.json; do
     [[ -s "$RUN_DIR/$file" ]] || die "Resume artifact missing: $RUN_DIR/$file"
   done
 fi
-for file in source-fingerprint.sha256 model-revisions.json raw-data-manifest.json "pip-freeze-${SLURM_JOB_ID}.txt"; do
+for file in source-fingerprint.sha256 model-revisions.json dataset-source.json raw-data-manifest.json "pip-freeze-${SLURM_JOB_ID}.txt"; do
   [[ ! -L "$RUN_DIR/$file" ]] || die "Refusing symlink output artifact: $RUN_DIR/$file"
 done
 
 # Credentials are the only input files allowed to persist outside the code.
 # Never echo their contents, enable shell tracing, or put tokens in sbatch args.
-for credential in "$KAGGLE_JSON" "$HF_TOKEN_FILE"; do
+for credential in "$HF_TOKEN_FILE"; do
   [[ -r "$credential" && -f "$credential" ]] || die "Credential file not readable: $credential"
   [[ "$(stat -c '%u' "$credential")" == "$ACTUAL_UID" ]] || die "Credential must be owned by your UID: $credential"
   mode="$(stat -c '%a' "$credential")"
@@ -165,6 +175,7 @@ RAM_REPO="$RAM_ROOT/repo"
 DOWNLOAD_DIR="$RAM_ROOT/downloads"
 export AGQA_ROOT="$RAM_ROOT/agqa"
 export TMPDIR="$RAM_ROOT/tmp" TMP="$RAM_ROOT/tmp" TEMP="$RAM_ROOT/tmp"
+export SQLITE_TMPDIR="$TMPDIR"
 export XDG_CACHE_HOME="$RAM_ROOT/xdg/cache" XDG_CONFIG_HOME="$RAM_ROOT/xdg/config"
 export XDG_DATA_HOME="$RAM_ROOT/xdg/data" XDG_STATE_HOME="$RAM_ROOT/xdg/state"
 export XDG_RUNTIME_DIR="$RAM_ROOT/xdg/runtime"
@@ -185,13 +196,13 @@ export PYTHONUSERBASE="$RAM_ROOT/python-user"
 export VIRTUALENV_OVERRIDE_APP_DATA="$RAM_ROOT/virtualenv-appdata"
 export UV_CACHE_DIR="$RAM_ROOT/uv-cache"
 export CARGO_HOME="$RAM_ROOT/cargo" RUSTUP_HOME="$RAM_ROOT/rustup"
-export KAGGLE_CONFIG_DIR="$RAM_ROOT/kaggle-auth"
 export WANDB_MODE=disabled WANDB_DIR="$RAM_ROOT/wandb"
 export WANDB_CACHE_DIR="$RAM_ROOT/wandb/cache" WANDB_CONFIG_DIR="$RAM_ROOT/wandb/config"
 export WANDB_DATA_DIR="$RAM_ROOT/wandb/data"
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 export PYTHONHASHSEED="$SEED" DYGENC_PREPROCESS_SEED="$SEED" DYGENC_SAVE_NETWORKX=0
 export DYGENC_LAZY_GRAPHS=1 DYGENC_GRAPH_CACHE_SIZE
+export DYGENC_INDEXED_QA=1 DYGENC_GRADIENT_CHECKPOINTING=1
 export DYGENC_EMBED_BATCH_SIZE OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 unset PYTHONHOME PYTHONPATH TRANSFORMERS_CACHE PYTORCH_TRANSFORMERS_CACHE PYTORCH_PRETRAINED_BERT_CACHE
@@ -199,7 +210,7 @@ unset PIP_TARGET PIP_PREFIX PIP_USER PIP_LOG PIP_BUILD_TRACKER VIRTUAL_ENV
 unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
 mkdir -p "$RAM_REPO" "$DOWNLOAD_DIR" "$AGQA_ROOT" "$TMPDIR" "$XDG_RUNTIME_DIR" \
   "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" \
-  "$HF_HOME" "$KAGGLE_CONFIG_DIR" "$VIRTUALENV_OVERRIDE_APP_DATA"
+  "$HF_HOME" "$VIRTUALENV_OVERRIDE_APP_DATA"
 
 "$PYTHON_BIN" - <<'PY'
 import sys
@@ -294,7 +305,7 @@ import hashlib
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
-files = sorted(root.glob("src/**/*.py")) + [root / "requirements-server.txt", root / "scripts/slurm/stage_agqa.py"]
+files = sorted(root.glob("src/**/*.py")) + sorted(root.glob("scripts/slurm/*.py")) + [root / "requirements-server.txt"]
 digest = hashlib.sha256()
 for path in sorted(files):
     digest.update(path.relative_to(root).as_posix().encode() + b"\0")
@@ -333,7 +344,7 @@ run_child install python -m pip install "${PIP_ARGS[@]}" --upgrade pip setuptool
 run_child install python -m pip install "${PIP_ARGS[@]}" torch==2.5.0 torchvision==0.20.0 \
   --index-url https://download.pytorch.org/whl/cu121
 # Never try a slow source compilation of torch_scatter on the school node.
-run_child install python -m pip install "${PIP_ARGS[@]}" --only-binary=:all: torch_scatter \
+run_child install python -m pip install "${PIP_ARGS[@]}" --only-binary=:all: 'torch_scatter==2.1.2+pt25cu121' \
   -f https://data.pyg.org/whl/torch-2.5.0+cu121.html
 run_child install python -m pip install "${PIP_ARGS[@]}" --prefer-binary -r "$RAM_REPO/requirements-server.txt"
 python -m pip check
@@ -354,6 +365,8 @@ import torch_scatter
 from src.model import DyGEnc
 if not torch.cuda.is_available():
     raise SystemExit("CUDA unavailable; check allocated GPU and node NVIDIA driver")
+if torch.cuda.device_count() != 1:
+    raise SystemExit("Expected exactly one Slurm-visible GPU; do not override CUDA_VISIBLE_DEVICES manually")
 if not torch.cuda.is_bf16_supported(including_emulation=False):
     raise SystemExit("This DyGEnc configuration requires native BF16 support (T4/P100 are unsupported)")
 print("CUDA:", torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))
@@ -364,7 +377,7 @@ PY
 export HF_TOKEN="$(< "$HF_TOKEN_FILE")"
 HF_TOKEN="${HF_TOKEN%$'\r'}"  # Accept one Windows CRLF-terminated line.
 [[ -n "$HF_TOKEN" && ! "$HF_TOKEN" =~ [[:space:]] ]] || die "HF_TOKEN_FILE must contain a single non-empty token without whitespace"
-export RUN_MODE RUN_DIR LLM_MODEL MBERT_MODEL LLM_REVISION MBERT_REVISION
+export RUN_MODE RUN_DIR LLM_MODEL MBERT_MODEL LLM_REVISION MBERT_REVISION DATASET_REPO DATASET_REVISION
 run_child model-download python - <<'PY'
 import json
 import os
@@ -378,6 +391,21 @@ requested = {
     "mbert": (os.environ["MBERT_MODEL"], os.environ["MBERT_REVISION"]),
 }
 api = HfApi()
+dataset_path = Path(os.environ["RUN_DIR"]) / "dataset-source.json"
+dataset_repo = os.environ["DATASET_REPO"]
+dataset_revision = os.environ["DATASET_REVISION"]
+if os.environ["RUN_MODE"] == "resume":
+    dataset = json.loads(dataset_path.read_text())
+    if dataset["repo_id"] != dataset_repo or (dataset_revision and dataset["revision"] != dataset_revision):
+        raise SystemExit("Dataset repository/revision differs from saved run")
+else:
+    dataset = {"repo_id": dataset_repo,
+               "revision": api.dataset_info(dataset_repo, revision=dataset_revision or "main").sha}
+    with tempfile.NamedTemporaryFile(mode="w", dir=dataset_path.parent, prefix=".dataset-source-", delete=False) as handle:
+        json.dump(dataset, handle, indent=2)
+        handle.write("\n")
+        dataset_temp = Path(handle.name)
+    dataset_temp.replace(dataset_path)
 if os.environ["RUN_MODE"] == "resume":
     models = json.loads(path.read_text())
     for name, (repo_id, revision) in requested.items():
@@ -401,21 +429,21 @@ PY
 DYGENC_LLM_REVISION="$(python -c 'import json,os; print(json.load(open(os.path.join(os.environ["RUN_DIR"],"model-revisions.json")))["llm"]["revision"])')"
 DYGENC_MBERT_REVISION="$(python -c 'import json,os; print(json.load(open(os.path.join(os.environ["RUN_DIR"],"model-revisions.json")))["mbert"]["revision"])')"
 export DYGENC_LLM_REVISION DYGENC_MBERT_REVISION
+DATASET_REVISION="$(python -c 'import json,os; print(json.load(open(os.path.join(os.environ["RUN_DIR"],"dataset-source.json")))["revision"])')"
+export DATASET_REVISION
 # Models are complete in RAM: prevent surprise HTTP access during computation.
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 unset HF_TOKEN
 
-cp -- "$KAGGLE_JSON" "$KAGGLE_CONFIG_DIR/kaggle.json"
-chmod 600 "$KAGGLE_CONFIG_DIR/kaggle.json"
-run_child data-download kaggle datasets download -d "$KAGGLE_DATASET" -p "$DOWNLOAD_DIR" --unzip -o
-rm -f -- "$KAGGLE_CONFIG_DIR/kaggle.json"
+run_child data-download python "$RAM_REPO/scripts/slurm/download_agqa.py" \
+  --downloads "$DOWNLOAD_DIR" --repo-id "$DATASET_REPO" --revision "$DATASET_REVISION"
 STAGE_ARGS=(python "$RAM_REPO/scripts/slurm/stage_agqa.py" --downloads "$DOWNLOAD_DIR" \
   --agqa-root "$AGQA_ROOT" --manifest "$AGQA_ROOT/raw-data-manifest.json")
 [[ -z "$ENG_URL" ]] || STAGE_ARGS+=(--eng-url "$ENG_URL")
 [[ -z "$ENG_FILE" ]] || STAGE_ARGS+=(--eng-file "$ENG_FILE")
 run_child stage "${STAGE_ARGS[@]}"
-# Kaggle usually deletes its downloaded zip with --unzip; remove any leftover
-# archives only after canonical raw inputs have been validated and hard-linked.
+# The selective downloader removes each verified archive after extraction.
+# Remove only leftover archives in this job's downloads after staging succeeds.
 run_child trim-archives python - "$RAM_ROOT" "$DOWNLOAD_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -450,7 +478,7 @@ PY
 memory_preflight "$MIN_TRAIN_HEADROOM_GB" before-preprocess
 cd "$RAM_REPO"
 run_child preprocess python -m src.datasets.preprocess.agqa
-[[ -s "$AGQA_ROOT/preprocessed_mbert/train/qa2sg.pkl" && -s "$AGQA_ROOT/preprocessed_mbert/test/qa2sg.pkl" ]] || die "Preprocessing did not produce both AGQA splits"
+[[ -s "$AGQA_ROOT/preprocessed_mbert/train/qa_index.sqlite3" && -s "$AGQA_ROOT/preprocessed_mbert/test/qa_index.sqlite3" ]] || die "Preprocessing did not produce both AGQA indexed splits"
 memory_preflight "$MIN_TRAIN_HEADROOM_GB" before-train
 
 # Direct child in the Slurm batch allocation: no nested srun signal ambiguity.
@@ -458,7 +486,9 @@ memory_preflight "$MIN_TRAIN_HEADROOM_GB" before-train
 cd "$RAM_ROOT"
 TRAIN_CMD=(python -m src.server_train --run-dir "$RUN_DIR" \
   --data-manifest "$RUN_DIR/raw-data-manifest.json" --epochs "$TARGET_EPOCHS" \
-  --checkpoint-every "$CHECKPOINT_EVERY" --seed "$SEED" --llm-model "$LLM_MODEL")
+  --checkpoint-every "$CHECKPOINT_EVERY" --seed "$SEED" --llm-model "$LLM_MODEL" \
+  --profile "$TRAIN_PROFILE" --accumulation-steps "$ACCUMULATION_STEPS" \
+  --loss-reduction "$LOSS_REDUCTION" --stop-after-updates "$STOP_AFTER_UPDATES")
 [[ "$RUN_MODE" != resume ]] || TRAIN_CMD+=(--resume "$RUN_DIR/last.pth")
 echo "Starting DyGEnc training; checkpoints survive, RAM data/models do not."
 run_child train "${TRAIN_CMD[@]}"

@@ -5,10 +5,11 @@ Only last.pth and best.pth are persisted under --run-dir. A temporary third
 checkpoint is required during atomic replacement. Frozen base weights are not
 saved: the base revision, initialization seed, source and runtime must match.
 
-This runner deliberately fixes batch_size=1 and workers=0. Accumulation is an
-equal-weight mean of per-sample token-mean losses, NOT a global token-weighted
-mean. Each sample is backpropagated immediately, so no group of GPU computation
-graphs is retained. Checkpoints always follow a complete optimizer update.
+This runner fixes microbatch_size=1 and workers=0. The CLI uses token-weighted
+causal-LM cross entropy over each accumulation group. The legacy sample-mean
+reduction remains available explicitly. Each sample is backpropagated at once;
+no group of GPU computation graphs is retained. GNN BatchNorm still operates
+per microbatch, so this is not identical to a physical multi-sample batch.
 
 CPU regression tests check exact replay. CUDA graph scatter/reduction kernels
 may still be nondeterministic; resume guarantees the cursor, state and RNG
@@ -49,9 +50,11 @@ class TrainState:
     train_cursor: int = 0  # next item in the deterministic epoch permutation
     optimizer_steps: int = 0
     train_loss_sum: float = 0.0
+    train_loss_weight: float = 0.0
     train_samples: int = 0
     val_cursor: int = 0
     val_loss_sum: float = 0.0
+    val_loss_weight: float = 0.0
     val_samples: int = 0
     best_val_loss: float = float("inf")
     best_epoch: int = -1
@@ -117,6 +120,26 @@ def _loss(model, batch):
     return loss
 
 
+def _weighted_loss(model, batch, reduction):
+    if reduction == "sample_mean":
+        return _loss(model, batch), 1
+    prepared = model.prepare_train_input(batch)
+    if not isinstance(prepared, (tuple, list)) or len(prepared) != 3:
+        raise ValueError("token_mean requires (embeddings, attention_mask, causal_labels)")
+    labels = prepared[2]
+    if not torch.is_tensor(labels) or labels.ndim != 2:
+        raise ValueError("Expected two-dimensional causal LM labels")
+    # Transformers predicts token t+1 from logits at t. The first label is
+    # never a target; -100 marks padding and prompt tokens.
+    weight = int(labels[..., 1:].ne(-100).sum().item())
+    if weight < 1:
+        raise ValueError("Training/evaluation sample has no supervised next-token targets")
+    loss = model(*prepared)
+    if loss.ndim != 0 or not bool(torch.isfinite(loss).item()):
+        raise FloatingPointError(f"Expected a finite scalar loss, got {loss}")
+    return loss, weight
+
+
 def _validate_state(state, train_size, val_size, epochs, accumulation_steps):
     if state.phase not in ("train", "validate") or not 0 <= state.epoch <= epochs:
         raise ValueError("Invalid checkpoint epoch/phase")
@@ -136,6 +159,7 @@ def fit(
     epochs, seed=18, accumulation_steps=1, checkpoint_every=100, resume=None,
     stop_requested=lambda: False, after_update=None, after_validation_sample=None,
     base_lr=None, warmup_epochs=1.0, max_grad_norm=0.1,
+    loss_reduction="sample_mean", stop_after_updates=0,
 ):
     """Return 0 on completion or 75 after a signal-requested safe checkpoint.
 
@@ -147,6 +171,9 @@ def fit(
     """
     if epochs < 1 or accumulation_steps < 1 or checkpoint_every < 1:
         raise ValueError("epochs, accumulation_steps and checkpoint_every must be positive")
+    if loss_reduction not in ("sample_mean", "token_mean") or stop_after_updates < 0:
+        raise ValueError("Invalid loss reduction or stop-after-updates")
+    signature = {**signature, "loss_reduction": loss_reduction}
     train_size, val_size = len(train_dataset), len(val_dataset)
     if train_size == 0 or val_size == 0:
         raise ValueError("Both training and validation need at least one eligible sample")
@@ -165,6 +192,7 @@ def fit(
     if resume is not None:
         state = TrainState(**load_checkpoint(resume, signature, model, optimizer))
     _validate_state(state, train_size, val_size, epochs, accumulation_steps)
+    invocation_start = state.optimizer_steps
 
     def save(path=last_path):
         snapshot = {
@@ -179,6 +207,9 @@ def fit(
         print(f"checkpoint={path.name} epoch={state.epoch} phase={state.phase} "
               f"train_cursor={state.train_cursor} val_cursor={state.val_cursor} "
               f"updates={state.optimizer_steps}", flush=True)
+        if torch.cuda.is_available():
+            print(f"GPU peak allocated={torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB "
+                  f"reserved={torch.cuda.max_memory_reserved() / 1024**3:.2f} GiB", flush=True)
 
     def stop_safely():
         if stop_requested():
@@ -200,18 +231,25 @@ def fit(
                 group_size = group_end - state.train_cursor
                 optimizer.zero_grad(set_to_none=True)
                 group_loss = 0.0
+                group_weight = 0
                 for position in range(state.train_cursor, group_end):
                     # No DataLoader worker/iterator RNG or prefetched samples:
                     # resumed execution reads exactly the next unsaved item.
                     batch = collate([train_dataset[order[position]]])
-                    loss = _loss(model, batch)
-                    group_loss += loss.detach().item()
-                    (loss / group_size).backward()
+                    loss, weight = _weighted_loss(model, batch, loss_reduction)
+                    group_loss += loss.detach().item() * weight
+                    group_weight += weight
+                    # Accumulate sums, then divide once by the actual target
+                    # count, including a short final group. No second /32.
+                    (loss * weight).backward()
                     del loss, batch
                 parameters = [
                     parameter for group in optimizer.param_groups
                     for parameter in group["params"] if parameter.requires_grad
                 ]
+                for parameter in parameters:
+                    if parameter.grad is not None:
+                        parameter.grad.div_(group_weight)
                 torch.nn.utils.clip_grad_norm_(
                     parameters, max_grad_norm, error_if_nonfinite=True,
                 )
@@ -226,14 +264,20 @@ def fit(
                 state.train_cursor = group_end
                 state.train_samples += group_size
                 state.train_loss_sum += group_loss
+                state.train_loss_weight += group_weight
                 state.optimizer_steps += 1
                 if state.optimizer_steps % checkpoint_every == 0 or group_end == train_size:
                     print(f"epoch={state.epoch + 1}/{epochs} samples={group_end}/{train_size} "
-                          f"updates={state.optimizer_steps} loss={group_loss / group_size:.6f}",
+                          f"updates={state.optimizer_steps} loss={group_loss / group_weight:.6f}",
                           flush=True)
                 if after_update is not None:
                     after_update(state)
                 if stop_safely():
+                    return PREEMPTED
+                if stop_after_updates and state.optimizer_steps - invocation_start >= stop_after_updates:
+                    save()
+                    print("Requested optimizer-update probe completed; resume checkpoint saved (exit 75).",
+                          flush=True)
                     return PREEMPTED
                 if state.optimizer_steps % checkpoint_every == 0:
                     save()
@@ -246,8 +290,9 @@ def fit(
         with torch.no_grad():
             while state.val_cursor < val_size:
                 batch = collate([val_dataset[state.val_cursor]])
-                loss = _loss(model, batch)
-                state.val_loss_sum += loss.item()
+                loss, weight = _weighted_loss(model, batch, loss_reduction)
+                state.val_loss_sum += loss.item() * weight
+                state.val_loss_weight += weight
                 state.val_samples += 1
                 state.val_cursor += 1
                 del loss, batch
@@ -257,8 +302,8 @@ def fit(
                     return PREEMPTED
                 if state.val_cursor % checkpoint_every == 0:
                     save()
-        val_loss = state.val_loss_sum / state.val_samples
-        print(f"epoch={state.epoch + 1} train_loss={state.train_loss_sum / state.train_samples:.6f} "
+        val_loss = state.val_loss_sum / state.val_loss_weight
+        print(f"epoch={state.epoch + 1} train_loss={state.train_loss_sum / state.train_loss_weight:.6f} "
               f"test_split_loss={val_loss:.6f}", flush=True)
         is_best = val_loss < state.best_val_loss
         if is_best:
@@ -268,8 +313,10 @@ def fit(
         state.phase = "train"
         state.train_cursor = state.train_samples = 0
         state.train_loss_sum = 0.0
+        state.train_loss_weight = 0.0
         state.val_cursor = state.val_samples = 0
         state.val_loss_sum = 0.0
+        state.val_loss_weight = 0.0
         if is_best:
             save(best_path)
         save()
@@ -308,7 +355,7 @@ def runtime_contract():
     for name in (
         "torch", "numpy", "transformers", "peft", "torch-geometric", "torch-scatter",
         "tokenizers", "accelerate", "safetensors", "huggingface-hub",
-        "scipy", "networkx",
+        "scipy", "networkx", "ijson",
     ):
         try:
             versions[name] = importlib.metadata.version(name)
@@ -334,6 +381,8 @@ def runtime_contract():
         "preprocess_seed": os.environ.get("DYGENC_PREPROCESS_SEED", "18"),
         "embed_batch_size": os.environ.get("DYGENC_EMBED_BATCH_SIZE", "unspecified"),
         "lazy_graphs": os.environ.get("DYGENC_LAZY_GRAPHS", "0"),
+        "indexed_qa": os.environ.get("DYGENC_INDEXED_QA", "0"),
+        "gradient_checkpointing": os.environ.get("DYGENC_GRADIENT_CHECKPOINTING", "0"),
     }
 
 
@@ -341,21 +390,26 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--data-manifest", type=Path, required=True)
-    parser.add_argument("--epochs", type=int, default=1,
+    parser.add_argument("--epochs", type=int, default=5,
                         help="Total target epochs; must remain identical on resume")
     parser.add_argument("--checkpoint-every", type=int, default=100,
                         help="Optimizer update interval (validation: sample interval)")
     parser.add_argument("--resume", type=Path, help="Trusted last.pth from the same run")
     parser.add_argument("--seed", type=int, default=18)
     parser.add_argument("--llm-model", default="meta-llama/Llama-3.2-3B")
-    parser.add_argument("--accumulation-steps", type=int, default=1)
+    parser.add_argument("--accumulation-steps", type=int, default=32)
+    parser.add_argument("--loss-reduction", choices=("token_mean", "sample_mean"), default="token_mean")
+    parser.add_argument("--profile", choices=("full", "upstream"), default="full",
+                        help="full: all nonempty groundings; upstream: original 50/10 graph filters")
+    parser.add_argument("--stop-after-updates", type=int, default=0,
+                        help="Save and exit 75 after N additional updates; 0 runs normally. Resume-compatible.")
     parser.add_argument("--lr", type=float, default=2e-5)
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if args.epochs < 1 or args.checkpoint_every < 1 or args.accumulation_steps < 1:
+    if args.epochs < 1 or args.checkpoint_every < 1 or args.accumulation_steps < 1 or args.stop_after_updates < 0:
         raise ValueError("epochs/checkpoint-every/accumulation-steps must be positive")
     if not 0 <= args.seed < 2**32 or not math.isfinite(args.lr) or args.lr <= 0:
         raise ValueError("seed must fit uint32 and lr must be finite and positive")
@@ -392,25 +446,28 @@ def main(argv=None):
     cfg.lr = args.lr
     # Infinity bypasses AGQADataset's empty-grounding filter and can crash it.
     # This finite upper bound retains every non-empty grounding without a cap.
-    cfg.train_seq_limit = cfg.val_seq_limit = sys.float_info.max
+    if args.profile == "full":
+        cfg.train_seq_limit = cfg.val_seq_limit = sys.float_info.max
     signature = {
-        "runner_contract": 1,
+        "runner_contract": 2,
+        "profile": args.profile,
         "config": asdict(cfg),
         "data": manifest,
         "source": source_fingerprint(Path(__file__).parent),
         "runtime": runtime_contract(),
         "model_revisions": revisions,
-        "accumulation": "equal-mean-of-per-sample-token-mean-losses",
+        "accumulation": args.loss_reduction,
     }
     # No validation-driven early stopping. Upstream AGQA only provides train/test;
     # selecting best.pth using test loss is a test-set leak, not an unbiased result.
     print("WARNING: monitoring AGQA test split, as upstream does. best.pth is selected "
           "using test loss; do not report it as unbiased held-out model selection. "
-          "No early stopping or sample/sequence cap is applied.", flush=True)
+          "No early stopping is applied. Profile=" + args.profile + ". "
+          "This is not a verified reproduction of the paper.", flush=True)
     with StopFlag() as stop:
         seed_everything(args.seed)
-        train_data = AGQADataset("train", lm_model="mbert", seq_limit=sys.float_info.max)
-        val_data = AGQADataset("test", lm_model="mbert", seq_limit=sys.float_info.max)
+        train_data = AGQADataset("train", lm_model="mbert", seq_limit=cfg.train_seq_limit)
+        val_data = AGQADataset("test", lm_model="mbert", seq_limit=cfg.val_seq_limit)
         # Keep random initialization of frozen added-token embeddings independent
         # of dataset deserialization work before restoring checkpoint RNG in fit.
         seed_everything(args.seed)
@@ -424,6 +481,7 @@ def main(argv=None):
             accumulation_steps=args.accumulation_steps, checkpoint_every=args.checkpoint_every,
             resume=args.resume, stop_requested=stop, base_lr=cfg.lr,
             warmup_epochs=cfg.warmup_epochs,
+            loss_reduction=args.loss_reduction, stop_after_updates=args.stop_after_updates,
         )
 
 

@@ -1,6 +1,7 @@
 import os 
 import json
 import pickle
+import gc
 from copy import deepcopy
 from itertools import pairwise, chain
 
@@ -12,23 +13,34 @@ from os.path import join as spj
 from torch_geometric.utils.convert import from_networkx
 from torch_geometric.transforms import AddLaplacianEigenvectorPE
 
-from src.utils.lm_modeling import load_model, load_text2embedding
 from src.utils.seed import set_seed
+from src.datasets.agqa_storage import INDEX_NAME, build_qa_index, iter_qa_json
 
 
-root_path = os.environ["AGQA_ROOT"]
+root_path = os.environ.get("AGQA_ROOT")
 LPE_NUM = 4
-logger.info(f"Setting lpe={LPE_NUM}")
-with open(spj(root_path, "data", "ENG.txt"), "rt", encoding="utf-8-sig") as file:
-    MAPPING = json.load(file)
-### load embed model
+MAPPING = {}
 MODEL_NAME = "mbert"
-logger.info(f"Loading LM={MODEL_NAME}")
-model, tokenizer, device = load_model[MODEL_NAME]()
-logger.info(device)
-text2embedding = load_text2embedding[MODEL_NAME]
-SG_GLOBAL = dict() # Only interval keys are needed later for QA grounding.
+model = tokenizer = device = text2embedding = None
+SG_GLOBAL = dict()  # Split + video ID -> interval keys, never graph tensors.
 SAVE_NETWORKX = os.environ.get("DYGENC_SAVE_NETWORKX", "1") == "1"
+
+
+def initialize_embedding_model():
+    # Importing helpers must not download/load a model or open AGQA data. The
+    # process running graph preprocessing owns exactly one embedding model.
+    global model, tokenizer, device, text2embedding, MAPPING
+    if model is not None:
+        return
+    if root_path is None:
+        raise RuntimeError("AGQA_ROOT must be set before graph preprocessing")
+    from src.utils.lm_modeling import load_model, load_text2embedding
+    logger.info(f"Setting lpe={LPE_NUM}; loading LM={MODEL_NAME}")
+    with open(spj(root_path, "data", "ENG.txt"), "rt", encoding="utf-8-sig") as file:
+        MAPPING = json.load(file)
+    model, tokenizer, device = load_model[MODEL_NAME]()
+    text2embedding = load_text2embedding[MODEL_NAME]
+    logger.info(device)
 
 
 def textualize_graph(nx_graph):
@@ -94,12 +106,13 @@ def parse_sg_keys(sg_item):
         seq.append(G)
     return seq, frames
 
-def preprocess_graphs():
+def preprocess_graphs(splits=("train", "test")):
+    initialize_embedding_model()
     logger.info("working with graphs")
 
     os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/", exist_ok=True)
     
-    for split in ["train", "test"]:
+    for split in splits:
         os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/{split}", exist_ok=True)
         os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/graphs/", exist_ok=True)
         if SAVE_NETWORKX:
@@ -195,51 +208,66 @@ def preprocess_graphs():
 
             # Do not retain a second full copy of every graph tensor in process
             # RAM when the serialized graphs already occupy tmpfs RAM.
-            SG_GLOBAL[sg_name] = tuple(all_pyg_graphs)
+            SG_GLOBAL[(split, sg_name)] = tuple(all_pyg_graphs)
             torch.save(all_pyg_graphs, f"{root_path}/preprocessed_{MODEL_NAME}/{split}/graphs/{sg_name}.pt")
             with open(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/descs/{sg_name}.pkl", "wb") as f:
                 pickle.dump(description, f)
+        # Assignment to sg_data on the next iteration would otherwise unpickle
+        # the next whole split while the previous split is still referenced.
+        del sg_data
+        gc.collect()
 
-def preprocess_qa():
-    for split in ["train", "test"]:
+
+def ground_qa_item(qa_item, all_ranges):
+    """Preserve upstream interval membership, duplicate ranges, and order."""
+    grounding_idx = sorted(load_grounding_frames(qa_item["sg_grounding"]),
+                           key=lambda x: int(x[-6:]))
+    unique_g_idx = list()
+    if grounding_idx:
+        for key_range in all_ranges:
+            for d_idx in grounding_idx:
+                if int(d_idx.lstrip()) in range(int(key_range[0].lstrip()), int(key_range[1].lstrip())):
+                    unique_g_idx.append(key_range)
+        # range excludes the right endpoint; the terminal interval is special.
+        if grounding_idx[-1] == all_ranges[-1][0]:
+            unique_g_idx.append(all_ranges[-1])
+    else:
+        unique_g_idx = list(all_ranges)
+    result = sorted(unique_g_idx, key=lambda x: int(x[0]))
+    if not result:
+        raise ValueError(f"No scene graphs grounded for QA from video {qa_item['video_id']!r}")
+    return result
+
+
+def preprocess_qa(splits=("train", "test")):
+    for split in splits:
         os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/{split}", exist_ok=True)
-        QA2SQ = {} # store mapping to grounded graphs in RAM instead of saving/loading to speed up
-
-        logger.info(f"Loading QA")
         qa_data_path = f"{root_path}/data/AGQA_balanced/{split}_balanced.txt"
-        with open(qa_data_path, mode='r', encoding='utf8') as file:
-            qa_json = json.load(file)
 
-        for qa_key, qa_item in tqdm(qa_json.items()):
-            all_ranges = SG_GLOBAL[qa_item['video_id']]
+        def grounding_for_item(qa_item):
+            return ground_qa_item(qa_item, SG_GLOBAL[(split, qa_item["video_id"])])
 
-            grounding_idx = sorted(load_grounding_frames(qa_item["sg_grounding"]),
-                key=lambda x: int(x[-6:]))
-            unique_g_idx = list()
-            if grounding_idx:
-                for key_range in all_ranges:
-                    for d_idx in grounding_idx:
-                        if int(d_idx.lstrip()) in range(int(key_range[0].lstrip()), int(key_range[1].lstrip())):
-                            unique_g_idx.append(key_range)
-                # range will not work for the last range - manual check
-                if grounding_idx[-1] == all_ranges[-1][0]:
-                    unique_g_idx.append(all_ranges[-1])
-            else:
-                # quite often
-                unique_g_idx = list(all_ranges)
-
-            QA2SQ[qa_key] = sorted(unique_g_idx, key=lambda x: int(x[0]))
-            assert len(QA2SQ[qa_key]) > 0
-        
-        with open(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/qa2sg.pkl", 'wb') as f:
-            pickle.dump(QA2SQ, f)
+        if os.environ.get("DYGENC_INDEXED_QA", "0") == "1":
+            logger.info(f"Streaming {split} QA into bounded-heap SQLite index")
+            index_path = f"{root_path}/preprocessed_{MODEL_NAME}/{split}/{INDEX_NAME}"
+            count = build_qa_index(index_path, tqdm(iter_qa_json(qa_data_path)), grounding_for_item)
+            logger.info(f"Indexed {count} QA records in source order: {index_path}")
+        else:
+            logger.info("Loading QA (legacy eager mode)")
+            with open(qa_data_path, mode='r', encoding='utf8') as file:
+                qa_json = json.load(file)
+            QA2SQ = {qa_key: grounding_for_item(qa_item) for qa_key, qa_item in tqdm(qa_json.items())}
+            with open(f"{root_path}/preprocessed_{MODEL_NAME}/{split}/qa2sg.pkl", 'wb') as f:
+                pickle.dump(QA2SQ, f)
+            del qa_json, QA2SQ
+        gc.collect()
 
 if __name__ == "__main__":
     set_seed(int(os.environ.get("DYGENC_PREPROCESS_SEED", "18")))
-    # iterate over graphs and embed all keyframes
-    # for AGQA (2M QA >> 10K SG) it is efficient
-    preprocess_graphs()
-    
-    # because each QA contains it's own grounding frame set
-    # we save unique SG idx for each element
-    preprocess_qa()
+    # Finish and release each split before loading the next monolithic SG
+    # pickle. Indexed QA streams one record at a time instead of json.load.
+    for split in ("train", "test"):
+        preprocess_graphs((split,))
+        preprocess_qa((split,))
+        SG_GLOBAL.clear()
+        gc.collect()

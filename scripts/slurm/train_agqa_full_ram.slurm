@@ -4,14 +4,16 @@
 #   sbatch scripts/slurm/train_agqa_full_ram.slurm
 # All dependencies, data, preprocessing and pretrained models live in tmpfs.
 # Only checkpoints, small run metadata, credentials and Slurm logs persist.
-# 96G is the school-cluster default, NOT a guarantee that full AGQA fits.
+# 90 GiB is about 96.6 decimal GB: below 100 GB. This is an allocation
+# request, not a guarantee that every full-dataset/preprocessing workload fits.
 
 #SBATCH --job-name=dygenc_agqa_full
 #SBATCH --partition=batch
+#SBATCH --nodelist=gpu03
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=96G
+#SBATCH --mem=90G
 #SBATCH --gres=gpu:1
 #SBATCH --time=2-00:00:00
 #SBATCH --signal=B:USR1@180

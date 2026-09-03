@@ -9,10 +9,11 @@
 
 #SBATCH --job-name=dygenc_agqa_resume
 #SBATCH --partition=batch
+#SBATCH --nodelist=gpu03
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=96G
+#SBATCH --mem=90G
 #SBATCH --gres=gpu:1
 #SBATCH --time=2-00:00:00
 #SBATCH --signal=B:USR1@180

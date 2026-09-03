@@ -17,6 +17,14 @@ model caches in executable tmpfs. Only checkpoints and small logs/metadata stay
 on disk. These jobs use the separate resumable `src.server_train` runner, not the
 legacy `train.py` below.
 
+The `a100-90g-v1` server release requests **90 GiB RAM (about 96.6 decimal GB)**
+and one native-BF16 GPU on `gpu03`. It downloads only the two required AGQA
+archives from Hugging Face, streams QA into a RAM-backed SQLite index, and
+checkpoints Llama activations without quantization. The A100 fresh/resume pair
+defaults to upstream sequence filters, 5 epochs and accumulation 32; full QA is
+an explicit profile. Run the resumable two-update probe before a long job.
+Memory fit and paper-level accuracy still need validation on the real server.
+
 ## Installation
 
 ```bash

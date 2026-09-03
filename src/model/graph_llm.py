@@ -26,6 +26,20 @@ EOS = '<|end_of_text|>'
 IGNORE_INDEX = -100
 
 
+def configure_llama_checkpointing(model, enabled):
+    """Recompute decoder activations only; never replay the GNN's BatchNorm.
+
+    Non-reentrant checkpointing preserves gradients through the graph soft
+    prompt even though the pretrained Llama parameters are frozen. Keep RNG
+    state so LoRA dropout is replayed consistently during recomputation.
+    """
+    if enabled:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={
+            "use_reentrant": False, "preserve_rng_state": True,
+        })
+        model.config.use_cache = False
+
+
 class DGMap3d(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -36,7 +50,6 @@ class DGMap3d(torch.nn.Module):
 
         logger.info('Loading LLAMA')
         kwargs = {
-            "max_memory": {0: '80GiB'},
             "device_map": "cuda",
             "revision": os.environ.get("DYGENC_LLM_REVISION", "main"),
         }
@@ -71,6 +84,10 @@ class DGMap3d(torch.nn.Module):
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, config)
+        checkpointing = os.environ.get("DYGENC_GRADIENT_CHECKPOINTING", "0")
+        if checkpointing not in ("0", "1"):
+            raise ValueError("DYGENC_GRADIENT_CHECKPOINTING must be 0 or 1")
+        configure_llama_checkpointing(model, checkpointing == "1")
         self.word_embedding = model.get_input_embeddings()
         self.model = model
         logger.info('Finish loading LLAMA!')
@@ -257,6 +274,7 @@ class DGMap3d(torch.nn.Module):
                 attention_mask=attention_mask,
                 return_dict=True,
                 labels=label_input_ids,
+                use_cache=False,
             )
         return outputs.loss
 
