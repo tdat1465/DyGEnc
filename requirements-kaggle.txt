@@ -1,0 +1,5 @@
+# Kaggle T4 runtime (Python 3.12, preinstalled Torch 2.10.0+cu128).
+# Do not add torch/torchvision here: scripts/kaggle/run_agqa_t4.py verifies and
+# deliberately reuses Kaggle's CUDA build. torch-scatter is installed
+# separately from the matching official PyG wheel index.
+-r requirements-server.txt

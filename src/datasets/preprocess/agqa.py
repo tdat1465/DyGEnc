@@ -3,7 +3,7 @@ import json
 import pickle
 import gc
 from copy import deepcopy
-from itertools import pairwise, chain
+from itertools import pairwise, chain, islice
 
 import torch
 import networkx as nx
@@ -36,7 +36,8 @@ def initialize_embedding_model():
         raise RuntimeError("AGQA_ROOT must be set before graph preprocessing")
     from src.utils.lm_modeling import load_model, load_text2embedding
     logger.info(f"Setting lpe={LPE_NUM}; loading LM={MODEL_NAME}")
-    with open(spj(root_path, "data", "ENG.txt"), "rt", encoding="utf-8-sig") as file:
+    eng_path = os.environ.get("AGQA_ENG_FILE", spj(root_path, "data", "ENG.txt"))
+    with open(eng_path, "rt", encoding="utf-8-sig") as file:
         MAPPING = json.load(file)
     model, tokenizer, device = load_model[MODEL_NAME]()
     text2embedding = load_text2embedding[MODEL_NAME]
@@ -106,7 +107,7 @@ def parse_sg_keys(sg_item):
         seq.append(G)
     return seq, frames
 
-def preprocess_graphs(splits=("train", "test")):
+def preprocess_graphs(splits=("train", "test"), allowed_video_ids=None):
     initialize_embedding_model()
     logger.info("working with graphs")
 
@@ -121,10 +122,23 @@ def preprocess_graphs(splits=("train", "test")):
 
         # iterate over splits
         sg_file = f"AGQA_{split}_stsgs.pkl"
-        with open(f"{root_path}/data/AGQA_scene_graphs/{sg_file}", "rb") as file:
+        scene_graph_dir = os.environ.get(
+            "AGQA_SCENE_GRAPHS_DIR", f"{root_path}/data/AGQA_scene_graphs",
+        )
+        with open(spj(scene_graph_dir, sg_file), "rb") as file:
             sg_data = pickle.load(file)
 
-        for sg_name, sg_item in tqdm(sg_data.items()):
+        selected = None if allowed_video_ids is None else frozenset(allowed_video_ids)
+        if selected is not None:
+            missing = selected.difference(sg_data)
+            if missing:
+                preview = ", ".join(sorted(missing)[:3])
+                raise ValueError(f"QA smoke selection is missing scene graph video(s): {preview}")
+        graph_items = (
+            sg_data.items() if selected is None
+            else ((name, item) for name, item in sg_data.items() if name in selected)
+        )
+        for sg_name, sg_item in tqdm(graph_items, total=None if selected is None else len(selected)):
             sg_seq_nx, seq_frame_names = parse_sg_keys(sg_item)
             assert len(sg_seq_nx) > 0
             if SAVE_NETWORKX:
@@ -239,10 +253,49 @@ def ground_qa_item(qa_item, all_ranges):
     return result
 
 
-def preprocess_qa(splits=("train", "test")):
+def selected_qa_records(path, allowed_video_ids=None, max_records=0):
+    """Stream a deterministic QA subset without loading the complete JSON.
+
+    A zero record limit retains every QA. ``allowed_video_ids`` is selected in
+    QA source order, while records themselves also retain their original order.
+    """
+    selected = None if allowed_video_ids is None else frozenset(allowed_video_ids)
+    records = (
+        (qa_id, item) for qa_id, item in iter_qa_json(path)
+        if selected is None or item.get("video_id") in selected
+    )
+    return records if max_records == 0 else islice(records, max_records)
+
+
+def select_smoke_video_ids(path, max_videos):
+    """Return the first distinct video IDs in QA source order."""
+    if max_videos < 1:
+        raise ValueError("max_videos must be positive")
+    selected = []
+    seen = set()
+    for _, item in iter_qa_json(path):
+        video_id = item.get("video_id")
+        if not isinstance(video_id, str) or not video_id:
+            raise ValueError("Every AGQA QA record must contain a nonempty video_id")
+        if video_id not in seen:
+            seen.add(video_id)
+            selected.append(video_id)
+            if len(selected) == max_videos:
+                break
+    if not selected:
+        raise ValueError("AGQA QA split contains no videos")
+    return tuple(selected)
+
+
+def preprocess_qa(splits=("train", "test"), allowed_video_ids=None, max_records=0):
+    if max_records < 0:
+        raise ValueError("max_records cannot be negative")
     for split in splits:
         os.makedirs(f"{root_path}/preprocessed_{MODEL_NAME}/{split}", exist_ok=True)
-        qa_data_path = f"{root_path}/data/AGQA_balanced/{split}_balanced.txt"
+        balanced_dir = os.environ.get(
+            "AGQA_BALANCED_DIR", f"{root_path}/data/AGQA_balanced",
+        )
+        qa_data_path = spj(balanced_dir, f"{split}_balanced.txt")
 
         def grounding_for_item(qa_item):
             return ground_qa_item(qa_item, SG_GLOBAL[(split, qa_item["video_id"])])
@@ -250,9 +303,12 @@ def preprocess_qa(splits=("train", "test")):
         if os.environ.get("DYGENC_INDEXED_QA", "0") == "1":
             logger.info(f"Streaming {split} QA into bounded-heap SQLite index")
             index_path = f"{root_path}/preprocessed_{MODEL_NAME}/{split}/{INDEX_NAME}"
-            count = build_qa_index(index_path, tqdm(iter_qa_json(qa_data_path)), grounding_for_item)
+            records = selected_qa_records(qa_data_path, allowed_video_ids, max_records)
+            count = build_qa_index(index_path, tqdm(records), grounding_for_item)
             logger.info(f"Indexed {count} QA records in source order: {index_path}")
         else:
+            if allowed_video_ids is not None or max_records:
+                raise RuntimeError("Bounded smoke preprocessing requires DYGENC_INDEXED_QA=1")
             logger.info("Loading QA (legacy eager mode)")
             with open(qa_data_path, mode='r', encoding='utf8') as file:
                 qa_json = json.load(file)
@@ -264,10 +320,29 @@ def preprocess_qa(splits=("train", "test")):
 
 if __name__ == "__main__":
     set_seed(int(os.environ.get("DYGENC_PREPROCESS_SEED", "18")))
+    try:
+        max_videos = int(os.environ.get("DYGENC_SMOKE_VIDEOS_PER_SPLIT", "0"))
+        max_qa = int(os.environ.get("DYGENC_SMOKE_QA_PER_SPLIT", "0"))
+    except ValueError as error:
+        raise ValueError("Smoke video/QA limits must be nonnegative integers") from error
+    if max_videos < 0 or max_qa < 0:
+        raise ValueError("Smoke video/QA limits must be nonnegative integers")
+    if (max_videos or max_qa) and os.environ.get("DYGENC_INDEXED_QA", "0") != "1":
+        raise RuntimeError("Bounded smoke preprocessing requires DYGENC_INDEXED_QA=1")
     # Finish and release each split before loading the next monolithic SG
     # pickle. Indexed QA streams one record at a time instead of json.load.
     for split in ("train", "test"):
-        preprocess_graphs((split,))
-        preprocess_qa((split,))
+        balanced_dir = os.environ.get(
+            "AGQA_BALANCED_DIR", f"{root_path}/data/AGQA_balanced",
+        )
+        qa_path = spj(balanced_dir, f"{split}_balanced.txt")
+        selected_videos = select_smoke_video_ids(qa_path, max_videos) if max_videos else None
+        if selected_videos is not None:
+            logger.warning(
+                f"SMOKE MODE: preprocessing {len(selected_videos)} {split} videos "
+                f"and at most {max_qa or 'all'} QA records; not a full evaluation"
+            )
+        preprocess_graphs((split,), allowed_video_ids=selected_videos)
+        preprocess_qa((split,), allowed_video_ids=selected_videos, max_records=max_qa)
         SG_GLOBAL.clear()
         gc.collect()

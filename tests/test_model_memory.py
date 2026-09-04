@@ -5,8 +5,10 @@ access, tokenizer, pretrained model download, graph package, or GPU is needed.
 """
 
 import ast
+import contextlib
 import copy
 import importlib.util
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -22,24 +24,146 @@ except ModuleNotFoundError as error:
 from torch.utils.checkpoint import checkpoint
 
 
-def load_checkpoint_helper():
-    """Execute only the actual helper, not unrelated model module imports."""
+def load_graph_llm_function(name, namespace=None):
+    """Execute one helper without importing unrelated GPU-heavy modules."""
     source = Path(__file__).resolve().parents[1] / "src/model/graph_llm.py"
     module = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
     functions = [
         node for node in module.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "configure_llama_checkpointing"
+        and node.name == name
     ]
     if len(functions) != 1:
-        raise AssertionError("Expected exactly one decoder checkpoint helper")
-    namespace = {}
+        raise AssertionError(f"Expected exactly one {name} helper")
+    namespace = {} if namespace is None else dict(namespace)
     subset = ast.Module(body=functions, type_ignores=[])
     exec(compile(subset, str(source), "exec"), namespace)
-    return namespace["configure_llama_checkpointing"]
+    return namespace[name]
 
 
-configure_llama_checkpointing = load_checkpoint_helper()
+configure_llama_checkpointing = load_graph_llm_function("configure_llama_checkpointing")
+resolve_compute_dtype = load_graph_llm_function(
+    "resolve_compute_dtype", {"os": os, "torch": torch},
+)
+resolve_target_only_loss = load_graph_llm_function(
+    "resolve_target_only_loss", {"os": os},
+)
+target_only_causal_loss = load_graph_llm_function(
+    "target_only_causal_loss", {"torch": torch, "IGNORE_INDEX": -100},
+)
+prepare_kbit_spy = mock.Mock(side_effect=lambda model: model)
+prepare_llama_base_for_lora = load_graph_llm_function(
+    "prepare_llama_base_for_lora",
+    {"torch": torch, "prepare_model_for_kbit_training": prepare_kbit_spy},
+)
+
+
+def load_maybe_autocast():
+    source = Path(__file__).resolve().parents[1] / "src/model/graph_llm.py"
+    module = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    owner = next(node for node in module.body
+                 if isinstance(node, ast.ClassDef) and node.name == "DGMap3d")
+    methods = [node for node in owner.body
+               if isinstance(node, ast.FunctionDef) and node.name == "maybe_autocast"]
+    if len(methods) != 1:
+        raise AssertionError("Expected exactly one maybe_autocast method")
+    namespace = {"contextlib": contextlib, "torch": torch}
+    exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace["maybe_autocast"]
+
+
+maybe_autocast = load_maybe_autocast()
+
+
+class ComputeDtypeTests(unittest.TestCase):
+    def test_default_and_explicit_compute_dtypes(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIs(resolve_compute_dtype(), torch.bfloat16)
+        for name, expected in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
+            with self.subTest(name=name):
+                self.assertIs(resolve_compute_dtype(name), expected)
+
+    def test_invalid_compute_dtype_fails_closed(self):
+        for value in ("", "BF16", "float16", "fp32", "int8"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "DYGENC_COMPUTE_DTYPE"):
+                resolve_compute_dtype(value)
+
+    def test_fp16_freezes_unquantized_base_without_upcasting(self):
+        prepare_kbit_spy.reset_mock()
+        model = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Linear(4, 2)).half()
+        result = prepare_llama_base_for_lora(model, torch.float16)
+        self.assertIs(result, model)
+        prepare_kbit_spy.assert_not_called()
+        self.assertTrue(all(parameter.dtype == torch.float16 for parameter in model.parameters()))
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.parameters()))
+
+    def test_bf16_retains_existing_peft_preparation(self):
+        prepare_kbit_spy.reset_mock()
+        model = torch.nn.Linear(2, 2).to(torch.bfloat16)
+        self.assertIs(prepare_llama_base_for_lora(model, torch.bfloat16), model)
+        prepare_kbit_spy.assert_called_once_with(model)
+
+    def test_fp16_rejects_quantized_base(self):
+        for attribute, value in (
+            ("is_loaded_in_4bit", True),
+            ("is_loaded_in_8bit", True),
+            ("quantization_method", "gptq"),
+        ):
+            with self.subTest(attribute=attribute):
+                model = torch.nn.Linear(2, 2).half()
+                setattr(model, attribute, value)
+                with self.assertRaisesRegex(ValueError, "unquantized"):
+                    prepare_llama_base_for_lora(model, torch.float16)
+
+    def test_autocast_uses_selected_fp16_dtype(self):
+        owner = SimpleNamespace(device=torch.device("cuda"), compute_dtype=torch.float16)
+        sentinel = object()
+        with mock.patch("torch.cuda.amp.autocast", return_value=sentinel) as autocast:
+            self.assertIs(maybe_autocast(owner), sentinel)
+        autocast.assert_called_once_with(dtype=torch.float16)
+
+    def test_target_only_loss_flag_is_strict_and_disabled_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIs(resolve_target_only_loss(), False)
+        self.assertIs(resolve_target_only_loss("0"), False)
+        self.assertIs(resolve_target_only_loss("1"), True)
+        for value in ("", "true", "yes", "2"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "DYGENC_TARGET_ONLY_LOSS"):
+                resolve_target_only_loss(value)
+
+
+class TargetOnlyValidationTests(unittest.TestCase):
+    class Decoder:
+        config = SimpleNamespace(vocab_size=11)
+
+        def __call__(self, **_kwargs):
+            raise AssertionError("Invalid target-only inputs must fail before decoder execution")
+
+    def test_rejects_non_singleton_microbatch_and_shape_or_dtype_mismatch(self):
+        valid_inputs = torch.randn(1, 4, 3)
+        valid_mask = torch.ones(1, 4, dtype=torch.long)
+        valid_labels = torch.tensor([[-100, -100, 3, 4]], dtype=torch.long)
+        cases = (
+            (valid_inputs.expand(2, -1, -1), valid_mask.expand(2, -1),
+             valid_labels.expand(2, -1), "microbatch size 1"),
+            (valid_inputs[:, :-1], valid_mask, valid_labels, "sequence shapes"),
+            (valid_inputs, valid_mask, valid_labels.to(torch.int32), "torch.long"),
+        )
+        for inputs, mask, labels, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                target_only_causal_loss(self.Decoder(), inputs, mask, labels)
+
+    def test_rejects_missing_or_out_of_vocabulary_supervision(self):
+        inputs = torch.randn(1, 4, 3)
+        mask = torch.ones(1, 4, dtype=torch.long)
+        for labels, message in (
+            (torch.full((1, 4), -100, dtype=torch.long), "no supervised"),
+            (torch.tensor([[-100, -100, 3, 11]]), "outside the model vocabulary"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                target_only_causal_loss(self.Decoder(), inputs, mask, labels)
 
 
 class CheckpointConfigurationTests(unittest.TestCase):
@@ -175,6 +299,143 @@ class CheckpointPrimitiveTests(unittest.TestCase):
     "Optional tiny Llama integration needs transformers and peft",
 )
 class TinyLlamaIntegrationTests(unittest.TestCase):
+    def test_target_only_matches_full_causal_loss_and_gradients(self):
+        from peft import LoraConfig, get_peft_model
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        old_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, old_threads)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(29)
+            config = LlamaConfig(
+                vocab_size=47, hidden_size=32, intermediate_size=64,
+                num_hidden_layers=2, num_attention_heads=4,
+                num_key_value_heads=2, max_position_embeddings=64,
+                attention_dropout=0.0, use_cache=False,
+                pad_token_id=0, bos_token_id=1, eos_token_id=2,
+            )
+            config._attn_implementation = "eager"
+            base = prepare_llama_base_for_lora(
+                LlamaForCausalLM(config).to(torch.float16), torch.float16,
+            )
+            prototype = get_peft_model(base, LoraConfig(
+                r=2, lora_alpha=4, lora_dropout=0.0,
+                target_modules=["q_proj", "v_proj"],
+                bias="none", task_type="CAUSAL_LM",
+            ))
+            configure_llama_checkpointing(prototype, True)
+            input_template = torch.randn(1, 9, config.hidden_size, dtype=torch.float16)
+            attention_mask = torch.ones(1, 9, dtype=torch.long)
+            # Include an ignored gap to verify that positions, rather than only
+            # a contiguous answer suffix, drive target selection.
+            labels = torch.tensor([[-100, -100, -100, 5, -100, 7, 8, 9, 10]])
+
+            results = []
+            for sparse in (False, True):
+                model = copy.deepcopy(prototype)
+                inputs = input_template.clone().requires_grad_(True)
+                model.train()
+                if sparse:
+                    loss = target_only_causal_loss(model, inputs, attention_mask, labels)
+                else:
+                    loss = model(
+                        inputs_embeds=inputs, attention_mask=attention_mask,
+                        labels=labels, return_dict=True, use_cache=False,
+                    ).loss
+                loss.backward()
+                gradients = {
+                    name: parameter.grad.detach().clone()
+                    for name, parameter in model.named_parameters()
+                    if parameter.requires_grad
+                }
+                self.assertTrue(gradients)
+                self.assertTrue(all(torch.isfinite(gradient).all()
+                                    for gradient in gradients.values()))
+                self.assertIsNotNone(inputs.grad)
+                self.assertTrue(torch.isfinite(inputs.grad).all())
+                results.append((loss.detach(), gradients, inputs.grad.detach().clone()))
+
+            full, sparse = results
+            torch.testing.assert_close(full[0], sparse[0], rtol=0, atol=0)
+            self.assertEqual(full[1].keys(), sparse[1].keys())
+            for name in full[1]:
+                torch.testing.assert_close(
+                    full[1][name], sparse[1][name], rtol=1e-4, atol=1e-5,
+                    msg=lambda message, name=name: f"{name}: {message}",
+                )
+            torch.testing.assert_close(full[2], sparse[2], rtol=1e-4, atol=1e-5)
+
+    def test_fp16_unquantized_lora_keeps_base_small_and_trainable_path_intact(self):
+        from peft import LoraConfig, get_peft_model
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        old_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, old_threads)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(13)
+            config = LlamaConfig(
+                vocab_size=47, hidden_size=32, intermediate_size=64,
+                num_hidden_layers=2, num_attention_heads=4,
+                num_key_value_heads=2, max_position_embeddings=64,
+                attention_dropout=0.1, use_cache=False,
+                pad_token_id=0, bos_token_id=1, eos_token_id=2,
+            )
+            config._attn_implementation = "eager"
+            base = LlamaForCausalLM(config).to(torch.float16)
+            base = prepare_llama_base_for_lora(base, torch.float16)
+            self.assertTrue(all(parameter.dtype == torch.float16
+                                for parameter in base.parameters()))
+            self.assertTrue(all(not parameter.requires_grad for parameter in base.parameters()))
+
+            model = get_peft_model(base, LoraConfig(
+                r=2, lora_alpha=4, lora_dropout=0.25,
+                target_modules=["q_proj", "v_proj"],
+                bias="none", task_type="CAUSAL_LM",
+            ))
+            configure_llama_checkpointing(model, True)
+            base_parameters = {
+                name: parameter for name, parameter in model.named_parameters()
+                if "lora_" not in name
+            }
+            adapter_parameters = {
+                name: parameter for name, parameter in model.named_parameters()
+                if "lora_" in name
+            }
+            self.assertTrue(base_parameters)
+            self.assertTrue(adapter_parameters)
+            self.assertTrue(all(parameter.dtype == torch.float16
+                                for parameter in base_parameters.values()))
+            self.assertTrue(all(not parameter.requires_grad
+                                for parameter in base_parameters.values()))
+            self.assertTrue(all(parameter.dtype == torch.float32 and parameter.requires_grad
+                                for parameter in adapter_parameters.values()))
+
+            projector = torch.nn.Linear(5, config.hidden_size)
+            features = torch.randn(1, 3, 5)
+            token_ids = torch.randint(3, config.vocab_size, (1, 6))
+            inputs = torch.cat((
+                projector(features).to(torch.float16),
+                model.get_input_embeddings()(token_ids),
+            ), dim=1)
+            labels = torch.randint(3, config.vocab_size, (1, inputs.shape[1]))
+            labels[:, :3] = -100
+            model.train()
+            output = model(
+                inputs_embeds=inputs,
+                attention_mask=torch.ones_like(labels),
+                labels=labels, use_cache=False,
+            )
+            self.assertTrue(torch.isfinite(output.loss))
+            output.loss.backward()
+            self.assertIsNotNone(projector.weight.grad)
+            self.assertTrue(torch.isfinite(projector.weight.grad).all())
+            self.assertTrue(all(parameter.grad is None
+                                for parameter in base_parameters.values()))
+            self.assertTrue(all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                                for parameter in adapter_parameters.values()))
+
     def test_lora_dropout_and_soft_prompt_checkpoint_replay(self):
         # Installed but broken/incompatible dependencies should fail, not be
         # silently reported as a missing-dependency skip.

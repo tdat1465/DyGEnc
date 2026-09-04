@@ -26,6 +26,97 @@ EOS = '<|end_of_text|>'
 IGNORE_INDEX = -100
 
 
+def resolve_compute_dtype(value=None):
+    """Resolve the explicit decoder compute/storage dtype.
+
+    BF16 remains the default used by the A100 runner.  Kaggle T4 jobs may opt
+    into FP16; accepting only these two named modes prevents an accidental
+    FP32 load or an implicit quantized path from silently changing the model.
+    """
+    value = os.environ.get("DYGENC_COMPUTE_DTYPE", "bf16") if value is None else value
+    dtypes = {"bf16": torch.bfloat16, "fp16": torch.float16}
+    if value not in dtypes:
+        raise ValueError("DYGENC_COMPUTE_DTYPE must be exactly 'bf16' or 'fp16'")
+    return dtypes[value]
+
+
+def resolve_target_only_loss(value=None):
+    """Return whether the opt-in, mathematically equivalent sparse loss is enabled."""
+    value = os.environ.get("DYGENC_TARGET_ONLY_LOSS", "0") if value is None else value
+    if value not in ("0", "1"):
+        raise ValueError("DYGENC_TARGET_ONLY_LOSS must be exactly '0' or '1'")
+    return value == "1"
+
+
+def prepare_llama_base_for_lora(model, compute_dtype):
+    """Freeze an unquantized Llama base without inflating the FP16 T4 copy.
+
+    The upstream BF16 path deliberately retains its existing PEFT preparation
+    behavior.  PEFT 0.15's k-bit preparation helper casts an ordinary FP16
+    model to FP32, however, which roughly doubles frozen-weight VRAM despite
+    this project not loading a quantized model.  On the T4 path, freezing the
+    base directly is sufficient; ``get_peft_model`` subsequently creates and
+    enables the LoRA parameters.
+    """
+    if compute_dtype == torch.bfloat16:
+        return prepare_model_for_kbit_training(model)
+    if compute_dtype != torch.float16:
+        raise ValueError("Only BF16 and FP16 Llama preparation are supported")
+    if (getattr(model, "is_loaded_in_4bit", False)
+            or getattr(model, "is_loaded_in_8bit", False)
+            or getattr(model, "quantization_method", None) is not None):
+        raise ValueError("The DyGEnc FP16 path requires an unquantized Llama base")
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
+def target_only_causal_loss(model, inputs_embeds, attention_mask, label_input_ids):
+    """Compute the usual causal CE without materializing prompt-token logits.
+
+    Server/Kaggle training uses microbatch size one.  A label at sequence index
+    ``j`` is predicted by the hidden state at ``j - 1``; prompt and padding
+    labels are -100.  Transformers 4.50 accepts those hidden-state indices via
+    ``logits_to_keep``, so selecting them before the large vocabulary projection
+    is equivalent to the standard ignored-label loss while using much less VRAM
+    for long graph prompts.
+    """
+    if (not torch.is_tensor(inputs_embeds) or inputs_embeds.ndim != 3
+            or not torch.is_tensor(attention_mask) or attention_mask.ndim != 2
+            or not torch.is_tensor(label_input_ids) or label_input_ids.ndim != 2):
+        raise ValueError("Expected rank-3 embeddings and rank-2 attention mask/labels")
+    if label_input_ids.shape[0] != 1:
+        raise ValueError("DYGENC_TARGET_ONLY_LOSS requires microbatch size 1")
+    if (tuple(inputs_embeds.shape[:2]) != tuple(label_input_ids.shape)
+            or tuple(attention_mask.shape) != tuple(label_input_ids.shape)):
+        raise ValueError("Embedding, attention-mask and label sequence shapes must match")
+    if label_input_ids.dtype != torch.long:
+        raise ValueError("Causal labels must use torch.long dtype")
+
+    shifted_labels = label_input_ids[0, 1:]
+    positions = shifted_labels.ne(IGNORE_INDEX).nonzero(as_tuple=False).flatten()
+    if positions.numel() == 0:
+        raise ValueError("Training/evaluation sample has no supervised next-token targets")
+    targets = shifted_labels.index_select(0, positions)
+    vocab_size = int(model.config.vocab_size)
+    if bool(((targets < 0) | (targets >= vocab_size)).any().item()):
+        raise ValueError("Supervised label is outside the model vocabulary")
+
+    outputs = model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        return_dict=True,
+        use_cache=False,
+        logits_to_keep=positions,
+    )
+    logits = outputs.logits
+    if logits.ndim != 3 or tuple(logits.shape[:2]) != (1, positions.numel()):
+        raise RuntimeError("Decoder returned unexpected target-only logits shape")
+    return torch.nn.functional.cross_entropy(
+        logits.reshape(-1, vocab_size).float(), targets.reshape(-1), reduction="mean",
+    )
+
+
 def configure_llama_checkpointing(model, enabled):
     """Recompute decoder activations only; never replay the GNN's BatchNorm.
 
@@ -44,6 +135,8 @@ class DGMap3d(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.compute_dtype = resolve_compute_dtype()
+        self.target_only_loss = resolve_target_only_loss()
 
         self.prompt = "Based on scene graph, "
         self.tail_prompt = ", with latent graph features "
@@ -61,7 +154,7 @@ class DGMap3d(torch.nn.Module):
 
         model = AutoModelForCausalLM.from_pretrained(
             cfg.llm_model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=self.compute_dtype,
             low_cpu_mem_usage=True,
             **kwargs
         )
@@ -74,7 +167,7 @@ class DGMap3d(torch.nn.Module):
         model.resize_token_embeddings(len(self.tokenizer))
 
         logger.info("Setup LLAMA with LORA!")
-        model = prepare_model_for_kbit_training(model)
+        model = prepare_llama_base_for_lora(model, self.compute_dtype)
         config = LoraConfig(
             r=self.cfg.lora_r,
             lora_alpha=self.cfg.lora_alpha,
@@ -122,13 +215,13 @@ class DGMap3d(torch.nn.Module):
     def device(self):
         return list(self.parameters())[0].device
 
-    def maybe_autocast(self, dtype=torch.bfloat16):
+    def maybe_autocast(self, dtype=None):
         # if on cpu, don't use autocast
-        # if on gpu, use autocast with dtype if provided, otherwise use torch.float16
+        # if on gpu, use the explicitly selected BF16/FP16 compute dtype
         enable_autocast = self.device != torch.device("cpu")
 
         if enable_autocast:
-            return torch.cuda.amp.autocast(dtype=dtype)
+            return torch.cuda.amp.autocast(dtype=self.compute_dtype if dtype is None else dtype)
         else:
             return contextlib.nullcontext()
 
@@ -269,6 +362,10 @@ class DGMap3d(torch.nn.Module):
 
     def forward(self, inputs_embeds, attention_mask, label_input_ids):
         with self.maybe_autocast():
+            if self.target_only_loss:
+                return target_only_causal_loss(
+                    self.model, inputs_embeds, attention_mask, label_input_ids,
+                )
             outputs = self.model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,

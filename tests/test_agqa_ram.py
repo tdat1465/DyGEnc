@@ -72,7 +72,8 @@ class GroundingRangeTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / "src/datasets/preprocess/agqa.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-                     and node.name in ("load_grounding_frames", "ground_qa_item", "preprocess_qa")]
+                     and node.name in ("load_grounding_frames", "ground_qa_item",
+                                       "selected_qa_records", "preprocess_qa")]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "data" / "AGQA_balanced").mkdir(parents=True)
@@ -83,7 +84,8 @@ class GroundingRangeTests(unittest.TestCase):
             from types import SimpleNamespace
             ranges = (("000001", "000003"), ("000003", "000003"))
             scope = dict(os=os, json=json, pickle=pickle, gc=gc, root_path=tmp,
-                         MODEL_NAME="mbert", SG_GLOBAL={(split, "video"): ranges for split in ("train", "test")}, chain=chain,
+                         MODEL_NAME="mbert", SG_GLOBAL={(split, "video"): ranges for split in ("train", "test")},
+                         chain=chain, spj=os.path.join,
                          tqdm=lambda items: items, logger=SimpleNamespace(info=lambda *args: None))
             exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), scope)
             with patch.dict(os.environ, {"DYGENC_INDEXED_QA": "0"}):
@@ -101,7 +103,8 @@ class GroundingRangeTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / "src/datasets/preprocess/agqa.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-                     and node.name in ("load_grounding_frames", "ground_qa_item", "preprocess_qa")]
+                     and node.name in ("load_grounding_frames", "ground_qa_item",
+                                       "selected_qa_records", "preprocess_qa")]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "data" / "AGQA_balanced").mkdir(parents=True)
@@ -113,7 +116,9 @@ class GroundingRangeTests(unittest.TestCase):
                 (root / "data" / "AGQA_balanced" / f"{split}_balanced.txt").write_text(json.dumps(qa))
             scope = dict(os=os, json=json, pickle=pickle, gc=gc, root_path=tmp, MODEL_NAME="mbert",
                          SG_GLOBAL={("train", "same_video"): train_ranges, ("test", "same_video"): test_ranges},
-                         chain=chain, INDEX_NAME=INDEX_NAME, build_qa_index=build_qa_index, iter_qa_json=iter_qa_json,
+                         chain=chain, spj=os.path.join, INDEX_NAME=INDEX_NAME,
+                         build_qa_index=build_qa_index, iter_qa_json=iter_qa_json,
+                         islice=__import__("itertools").islice,
                          tqdm=lambda items: items, logger=SimpleNamespace(info=lambda *args: None))
             exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), scope)
             with patch.dict(os.environ, {"DYGENC_INDEXED_QA": "0"}):
@@ -132,6 +137,65 @@ class GroundingRangeTests(unittest.TestCase):
                         self.assertEqual(indexed[position], (qa_id, item, expected_grounding[qa_id]))
                 finally:
                     indexed.close()
+
+    @unittest.skipUnless(importlib.util.find_spec("ijson"), "ijson is needed for smoke selection")
+    def test_smoke_selection_is_bounded_and_preserves_source_order(self):
+        from itertools import islice
+        from src.datasets.agqa_storage import iter_qa_json
+
+        source = Path(__file__).resolve().parents[1] / "src/datasets/preprocess/agqa.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in ("selected_qa_records", "select_smoke_video_ids")]
+        scope = {"iter_qa_json": iter_qa_json, "islice": islice}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), scope)
+        qa = {
+            "q0": {"video_id": "v2"}, "q1": {"video_id": "v2"},
+            "q2": {"video_id": "v1"}, "q3": {"video_id": "v3"},
+            "q4": {"video_id": "v1"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "train_balanced.txt"
+            path.write_text(json.dumps(qa), encoding="utf-8")
+            selected = scope["select_smoke_video_ids"](path, 2)
+            self.assertEqual(selected, ("v2", "v1"))
+            records = list(scope["selected_qa_records"](path, selected, 3))
+            self.assertEqual([qa_id for qa_id, _ in records], ["q0", "q1", "q2"])
+            self.assertTrue(all(item["video_id"] in selected for _, item in records))
+
+    @unittest.skipUnless(importlib.util.find_spec("ijson"), "ijson is needed for indexed preprocessing")
+    def test_indexed_qa_can_read_kaggle_raw_directory_without_copy(self):
+        from itertools import chain, islice
+        from types import SimpleNamespace
+        from src.datasets.agqa_storage import INDEX_NAME, IndexedQA, build_qa_index, iter_qa_json
+
+        source = Path(__file__).resolve().parents[1] / "src/datasets/preprocess/agqa.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in ("load_grounding_frames", "ground_qa_item",
+                                       "selected_qa_records", "preprocess_qa")]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runtime"
+            raw = Path(tmp) / "mounted-input" / "AGQA_balanced"
+            raw.mkdir(parents=True)
+            item = {"video_id": "video", "sg_grounding": {}, "question": "q", "answer": "a"}
+            (raw / "train_balanced.txt").write_text(json.dumps({"q0": item, "q1": item}))
+            scope = dict(os=os, json=json, pickle=pickle, gc=gc, root_path=str(root),
+                         MODEL_NAME="mbert", SG_GLOBAL={("train", "video"): (("000001", "000002"),)},
+                         chain=chain, islice=islice, spj=os.path.join, INDEX_NAME=INDEX_NAME,
+                         build_qa_index=build_qa_index, iter_qa_json=iter_qa_json,
+                         tqdm=lambda values: values, logger=SimpleNamespace(info=lambda *args: None))
+            exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), scope)
+            with patch.dict(os.environ, {
+                "DYGENC_INDEXED_QA": "1", "AGQA_BALANCED_DIR": str(raw),
+            }):
+                scope["preprocess_qa"](("train",), allowed_video_ids=("video",), max_records=1)
+            index = IndexedQA(root / "preprocessed_mbert" / "train" / INDEX_NAME)
+            try:
+                self.assertEqual(len(index), 1)
+                self.assertEqual(index[0][0], "q0")
+            finally:
+                index.close()
 
     def test_grounding_preserves_duplicates_and_terminal_interval(self):
         from itertools import chain

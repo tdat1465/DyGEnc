@@ -1,9 +1,10 @@
 """AGQA server trainer with bounded persistent output and mid-epoch resume.
 
-Data/model caches belong in the RAM filesystem selected by the launch script.
-Only last.pth and best.pth are persisted under --run-dir. A temporary third
-checkpoint is required during atomic replacement. Frozen base weights are not
-saved: the base revision, initialization seed, source and runtime must match.
+Data/model caches belong in the runtime workspace selected by the launch script
+(tmpfs on the school server, writable working storage on Kaggle). Only last.pth
+and best.pth are persisted under --run-dir. A temporary third checkpoint is
+required during atomic replacement. Frozen base weights are not saved: the base
+revision, initialization seed, source and runtime must match.
 
 This runner fixes microbatch_size=1 and workers=0. The CLI uses token-weighted
 causal-LM cross entropy over each accumulation group. The legacy sample-mean
@@ -36,11 +37,12 @@ import torch
 from src.utils.server_checkpoint import (
     CHECKPOINT_VERSION, atomic_torch_save, cleanup_stale_checkpoint_temps,
     load_checkpoint, model_snapshot,
-    rng_state, to_cpu,
+    restore_rng, rng_state, to_cpu,
 )
 
 
 PREEMPTED = 75
+MAX_AMP_OVERFLOW_RETRIES = 16
 
 
 @dataclass
@@ -140,6 +142,52 @@ def _weighted_loss(model, batch, reduction):
     return loss, weight
 
 
+def _trainable_parameters(optimizer):
+    """Return each trainable optimizer parameter once, preserving group order."""
+    result = []
+    seen = set()
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter.requires_grad and id(parameter) not in seen:
+                seen.add(id(parameter))
+                result.append(parameter)
+    return result
+
+
+def _gradients_are_finite(parameters):
+    """Synchronize only when FP16 scaling needs to decide whether to retry."""
+    found = False
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        found = True
+        if not bool(torch.isfinite(parameter.grad).all().item()):
+            return False
+    if not found:
+        raise RuntimeError("The loss produced no gradients for any trainable parameter")
+    return True
+
+
+def _snapshot_buffers(model):
+    """Keep mutable forward buffers stable when an overflowed group is replayed."""
+    return {
+        name: value.detach().clone()
+        for name, value in model.named_buffers(remove_duplicate=False)
+    }
+
+
+def _restore_buffers(model, snapshot):
+    buffers = dict(model.named_buffers(remove_duplicate=False))
+    if buffers.keys() != snapshot.keys():
+        raise RuntimeError("Model buffers changed while retrying an AMP-overflowed group")
+    with torch.no_grad():
+        for name, value in buffers.items():
+            saved = snapshot[name]
+            if value.shape != saved.shape or value.dtype != saved.dtype:
+                raise RuntimeError(f"Model buffer changed while retrying AMP group: {name}")
+            value.copy_(saved)
+
+
 def _validate_state(state, train_size, val_size, epochs, accumulation_steps):
     if state.phase not in ("train", "validate") or not 0 <= state.epoch <= epochs:
         raise ValueError("Invalid checkpoint epoch/phase")
@@ -159,7 +207,8 @@ def fit(
     epochs, seed=18, accumulation_steps=1, checkpoint_every=100, resume=None,
     stop_requested=lambda: False, after_update=None, after_validation_sample=None,
     base_lr=None, warmup_epochs=1.0, max_grad_norm=0.1,
-    loss_reduction="sample_mean", stop_after_updates=0,
+    loss_reduction="sample_mean", stop_after_updates=0, grad_scaler=None,
+    max_amp_overflow_retries=MAX_AMP_OVERFLOW_RETRIES,
 ):
     """Return 0 on completion or 75 after a signal-requested safe checkpoint.
 
@@ -173,7 +222,16 @@ def fit(
         raise ValueError("epochs, accumulation_steps and checkpoint_every must be positive")
     if loss_reduction not in ("sample_mean", "token_mean") or stop_after_updates < 0:
         raise ValueError("Invalid loss reduction or stop-after-updates")
-    signature = {**signature, "loss_reduction": loss_reduction}
+    if max_amp_overflow_retries < 0:
+        raise ValueError("max_amp_overflow_retries must be non-negative")
+    if grad_scaler is not None and not grad_scaler.is_enabled():
+        raise ValueError("Pass None instead of a disabled GradScaler")
+    signature = {
+        **signature,
+        "loss_reduction": loss_reduction,
+        "amp_grad_scaler": grad_scaler is not None,
+        "max_amp_overflow_retries": max_amp_overflow_retries,
+    }
     train_size, val_size = len(train_dataset), len(val_dataset)
     if train_size == 0 or val_size == 0:
         raise ValueError("Both training and validation need at least one eligible sample")
@@ -190,7 +248,9 @@ def fit(
               flush=True)
     state = TrainState()
     if resume is not None:
-        state = TrainState(**load_checkpoint(resume, signature, model, optimizer))
+        state = TrainState(**load_checkpoint(
+            resume, signature, model, optimizer, grad_scaler=grad_scaler,
+        ))
     _validate_state(state, train_size, val_size, epochs, accumulation_steps)
     invocation_start = state.optimizer_steps
 
@@ -201,6 +261,9 @@ def fit(
             "state": asdict(state),
             **model_snapshot(model),
             "optimizer": to_cpu(optimizer.state_dict()),
+            "grad_scaler": (
+                to_cpu(grad_scaler.state_dict()) if grad_scaler is not None else None
+            ),
             "rng": to_cpu(rng_state()),
         }
         atomic_torch_save(snapshot, path)
@@ -229,38 +292,76 @@ def fit(
             while state.train_cursor < train_size:
                 group_end = min(state.train_cursor + accumulation_steps, train_size)
                 group_size = group_end - state.train_cursor
-                optimizer.zero_grad(set_to_none=True)
-                group_loss = 0.0
-                group_weight = 0
-                for position in range(state.train_cursor, group_end):
-                    # No DataLoader worker/iterator RNG or prefetched samples:
-                    # resumed execution reads exactly the next unsaved item.
-                    batch = collate([train_dataset[order[position]]])
-                    loss, weight = _weighted_loss(model, batch, loss_reduction)
-                    group_loss += loss.detach().item() * weight
-                    group_weight += weight
-                    # Accumulate sums, then divide once by the actual target
-                    # count, including a short final group. No second /32.
-                    (loss * weight).backward()
-                    del loss, batch
-                parameters = [
-                    parameter for group in optimizer.param_groups
-                    for parameter in group["params"] if parameter.requires_grad
-                ]
-                for parameter in parameters:
-                    if parameter.grad is not None:
-                        parameter.grad.div_(group_weight)
-                torch.nn.utils.clip_grad_norm_(
-                    parameters, max_grad_norm, error_if_nonfinite=True,
-                )
-                if base_lr is not None:
-                    lr = learning_rate(
-                        base_lr, state.epoch + group_end / train_size, epochs, warmup_epochs,
+                parameters = _trainable_parameters(optimizer)
+                retry_rng = rng_state() if grad_scaler is not None else None
+                retry_buffers = _snapshot_buffers(model) if grad_scaler is not None else None
+                overflow_retries = 0
+                while True:
+                    optimizer.zero_grad(set_to_none=True)
+                    group_loss = 0.0
+                    group_weight = 0
+                    for position in range(state.train_cursor, group_end):
+                        # No DataLoader worker/iterator RNG or prefetched samples:
+                        # resumed execution reads exactly the next unsaved item.
+                        batch = collate([train_dataset[order[position]]])
+                        loss, weight = _weighted_loss(model, batch, loss_reduction)
+                        group_loss += loss.detach().item() * weight
+                        group_weight += weight
+                        # Accumulate sums, then divide once by the actual target
+                        # count, including a short final group. No second /32.
+                        weighted_loss = loss * weight
+                        if grad_scaler is None:
+                            weighted_loss.backward()
+                        else:
+                            grad_scaler.scale(weighted_loss).backward()
+                        del weighted_loss, loss, batch
+                    if grad_scaler is not None:
+                        # Unscale before token normalization and clipping so the
+                        # clipping threshold has its ordinary FP32 meaning.
+                        grad_scaler.unscale_(optimizer)
+                        if not _gradients_are_finite(parameters):
+                            old_scale = grad_scaler.get_scale()
+                            # unscale_ has recorded the non-finite gradients, so
+                            # step is skipped and update lowers the dynamic scale.
+                            grad_scaler.step(optimizer)
+                            grad_scaler.update()
+                            new_scale = grad_scaler.get_scale()
+                            optimizer.zero_grad(set_to_none=True)
+                            _restore_buffers(model, retry_buffers)
+                            restore_rng(retry_rng)
+                            overflow_retries += 1
+                            print(
+                                f"AMP overflow at epoch={state.epoch + 1} "
+                                f"samples={state.train_cursor}:{group_end}; "
+                                f"scale={old_scale:g}->{new_scale:g}; retry "
+                                f"{overflow_retries}/{max_amp_overflow_retries}",
+                                flush=True,
+                            )
+                            if overflow_retries > max_amp_overflow_retries:
+                                raise FloatingPointError(
+                                    "FP16 gradients remained non-finite after "
+                                    f"{max_amp_overflow_retries} retries"
+                                )
+                            continue
+                    for parameter in parameters:
+                        if parameter.grad is not None:
+                            parameter.grad.div_(group_weight)
+                    torch.nn.utils.clip_grad_norm_(
+                        parameters, max_grad_norm, error_if_nonfinite=True,
                     )
-                    for group in optimizer.param_groups:
-                        group["lr"] = lr
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    if base_lr is not None:
+                        lr = learning_rate(
+                            base_lr, state.epoch + group_end / train_size, epochs, warmup_epochs,
+                        )
+                        for group in optimizer.param_groups:
+                            group["lr"] = lr
+                    if grad_scaler is None:
+                        optimizer.step()
+                    else:
+                        grad_scaler.step(optimizer)
+                        grad_scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    break
                 state.train_cursor = group_end
                 state.train_samples += group_size
                 state.train_loss_sum += group_loss
@@ -383,6 +484,15 @@ def runtime_contract():
         "lazy_graphs": os.environ.get("DYGENC_LAZY_GRAPHS", "0"),
         "indexed_qa": os.environ.get("DYGENC_INDEXED_QA", "0"),
         "gradient_checkpointing": os.environ.get("DYGENC_GRADIENT_CHECKPOINTING", "0"),
+        "compute_dtype": os.environ.get("DYGENC_COMPUTE_DTYPE", "bf16"),
+        "amp_grad_scaler": os.environ.get("DYGENC_COMPUTE_DTYPE", "bf16") == "fp16",
+        "target_only_loss": os.environ.get("DYGENC_TARGET_ONLY_LOSS", "0"),
+        "smoke_limits": {
+            name: os.environ.get(name, "0") for name in (
+                "DYGENC_SMOKE_VIDEOS_PER_SPLIT",
+                "DYGENC_SMOKE_QA_PER_SPLIT",
+            )
+        },
     }
 
 
@@ -415,8 +525,18 @@ def main(argv=None):
         raise ValueError("seed must fit uint32 and lr must be finite and positive")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("This server runner needs exactly one allocated visible CUDA GPU")
-    if not torch.cuda.is_bf16_supported(including_emulation=False):
+    compute_dtype = os.environ.get("DYGENC_COMPUTE_DTYPE", "bf16")
+    if compute_dtype not in ("bf16", "fp16"):
+        raise ValueError("DYGENC_COMPUTE_DTYPE must be bf16 or fp16")
+    if compute_dtype == "bf16" and not torch.cuda.is_bf16_supported(including_emulation=False):
         raise RuntimeError("The upstream DyGEnc model requires a BF16-capable GPU")
+    grad_scaler = torch.amp.GradScaler("cuda") if compute_dtype == "fp16" else None
+    scaler_state = grad_scaler.state_dict() if grad_scaler is not None else None
+    scaler_contract = None if scaler_state is None else {
+        name: scaler_state[name] for name in (
+            "scale", "growth_factor", "backoff_factor", "growth_interval",
+        )
+    }
     revisions = {}
     for name in ("DYGENC_LLM_REVISION", "DYGENC_MBERT_REVISION"):
         revision = os.environ.get(name, "")
@@ -425,7 +545,7 @@ def main(argv=None):
         revisions[name] = revision
     manifest = read_data_manifest(args.data_manifest)
     if not os.environ.get("AGQA_ROOT"):
-        raise ValueError("AGQA_ROOT must point to the prepared RAM dataset")
+        raise ValueError("AGQA_ROOT must point to the prepared dataset runtime")
     # The launch script downloads model snapshots before training. These flags
     # make accidental fallback network downloads impossible in this process.
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -449,7 +569,7 @@ def main(argv=None):
     if args.profile == "full":
         cfg.train_seq_limit = cfg.val_seq_limit = sys.float_info.max
     signature = {
-        "runner_contract": 2,
+        "runner_contract": 3,
         "profile": args.profile,
         "config": asdict(cfg),
         "data": manifest,
@@ -457,6 +577,10 @@ def main(argv=None):
         "runtime": runtime_contract(),
         "model_revisions": revisions,
         "accumulation": args.loss_reduction,
+        "precision": {
+            "compute_dtype": compute_dtype,
+            "grad_scaler": scaler_contract,
+        },
     }
     # No validation-driven early stopping. Upstream AGQA only provides train/test;
     # selecting best.pth using test loss is a test-set leak, not an unbiased result.
@@ -482,6 +606,7 @@ def main(argv=None):
             resume=args.resume, stop_requested=stop, base_lr=cfg.lr,
             warmup_epochs=cfg.warmup_epochs,
             loss_reduction=args.loss_reduction, stop_after_updates=args.stop_after_updates,
+            grad_scaler=grad_scaler,
         )
 
 

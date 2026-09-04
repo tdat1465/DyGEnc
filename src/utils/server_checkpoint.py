@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 
 
 def to_cpu(value):
@@ -144,7 +144,7 @@ def cleanup_stale_checkpoint_temps(run_dir):
     return len(entries)
 
 
-def load_checkpoint(path, signature, model, optimizer):
+def load_checkpoint(path, signature, model, optimizer, grad_scaler=None):
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("checkpoint_version") != CHECKPOINT_VERSION:
         raise ValueError("Unsupported server checkpoint format")
@@ -153,10 +153,17 @@ def load_checkpoint(path, signature, model, optimizer):
             "Resume signature mismatch: source, data, model revisions, runtime, "
             "or training settings changed. Start a new run directory instead."
         )
+    saved_scaler = checkpoint.get("grad_scaler")
+    if (saved_scaler is None) != (grad_scaler is None):
+        raise ValueError(
+            "Checkpoint AMP GradScaler state does not match the current precision mode"
+        )
     restore_model(model, checkpoint)
     # PyTorch casts per-parameter optimizer tensors to the parameter device and
     # preserves CPU step counters for non-capturable AdamW. Blindly moving every
     # tensor to CUDA would break that distinction.
     optimizer.load_state_dict(checkpoint["optimizer"])
+    if grad_scaler is not None:
+        grad_scaler.load_state_dict(saved_scaler)
     restore_rng(checkpoint["rng"])
     return checkpoint["state"]

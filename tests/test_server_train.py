@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import random
 import tempfile
@@ -18,9 +19,13 @@ except ModuleNotFoundError as error:
 
 import numpy as np
 
-from src.server_train import PREEMPTED, StopFlag, epoch_order, fit, read_data_manifest, seed_everything
+from src.server_train import (
+    PREEMPTED, StopFlag, epoch_order, fit, read_data_manifest, runtime_contract,
+    seed_everything,
+)
 from src.utils.server_checkpoint import (
-    atomic_torch_save, cleanup_stale_checkpoint_temps, model_snapshot, restore_model, to_cpu,
+    atomic_torch_save, cleanup_stale_checkpoint_temps, load_checkpoint,
+    model_snapshot, restore_model, to_cpu,
 )
 
 
@@ -219,6 +224,24 @@ class ServerTrainTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "signature mismatch"):
                 self.run_toy(root, resume=root / "last.pth", signature={"toy": 2})
 
+    def test_checkpoint_records_and_enforces_scaler_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.run_toy(root)
+            checkpoint = self.read(root / "last.pth")
+            self.assertIn("grad_scaler", checkpoint)
+            self.assertIsNone(checkpoint["grad_scaler"])
+            model, optimizer = make_model()
+            scaler = torch.amp.GradScaler("cpu", init_scale=8.0)
+            before = {name: value.clone() for name, value in model.state_dict().items()}
+            with self.assertRaisesRegex(ValueError, "GradScaler state"):
+                load_checkpoint(
+                    root / "last.pth", checkpoint["signature"], model, optimizer,
+                    grad_scaler=scaler,
+                )
+            for name, value in model.state_dict().items():
+                self.assertTrue(torch.equal(value, before[name]))
+
     def test_stale_cleanup_only_removes_recognized_temps(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -297,6 +320,23 @@ class ServerTrainTests(unittest.TestCase):
             second.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "relative POSIX"):
                 read_data_manifest(second)
+
+    def test_runtime_contract_fingerprints_kaggle_precision_and_smoke_limits(self):
+        environment = {
+            "DYGENC_COMPUTE_DTYPE": "fp16",
+            "DYGENC_TARGET_ONLY_LOSS": "1",
+            "DYGENC_SMOKE_VIDEOS_PER_SPLIT": "4",
+            "DYGENC_SMOKE_QA_PER_SPLIT": "32",
+        }
+        with mock.patch.dict(os.environ, environment):
+            contract = runtime_contract()
+        self.assertEqual(contract["compute_dtype"], "fp16")
+        self.assertIs(contract["amp_grad_scaler"], True)
+        self.assertEqual(contract["target_only_loss"], "1")
+        self.assertEqual(contract["smoke_limits"], {
+            "DYGENC_SMOKE_VIDEOS_PER_SPLIT": "4",
+            "DYGENC_SMOKE_QA_PER_SPLIT": "32",
+        })
 
     def test_cpu_snapshot_does_not_alias_live_tensors(self):
         original = {"state": [torch.tensor(3.0)]}

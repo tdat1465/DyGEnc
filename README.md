@@ -5,9 +5,14 @@ reasoning using sequences of textual scene graphs and large language models.
 
 ## Kaggle source setup
 
-Import [the Kaggle clone notebook](notebooks/kaggle_clone.ipynb) to clone the
-`kaggle-ram-v1` version from `tdat1465/DyGEnc`. This is a source-setup cell, not a
-complete Kaggle training notebook; the current runner still requires native BF16.
+For a bounded compatibility test on a Kaggle Tesla T4, use branch
+`codex/kaggle-t4` and run [the T4 notebook](notebooks/kaggle_t4.ipynb). The
+complete setup, fresh-run, checkpoint, and resume instructions are in
+[the Kaggle T4 guide](KAGGLE_T4.md). This path uses unquantized FP16 with
+gradient scaling and is a smoke test, not a paper-accuracy result.
+
+The older [clone-only notebook](notebooks/kaggle_clone.ipynb) targets the
+`kaggle-ram-v1` source snapshot and does not provide T4 training support.
 
 ## RAM-only school-server jobs
 
