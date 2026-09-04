@@ -424,6 +424,7 @@ print(json.dumps({
         ):
             raise KaggleSetupError(f"Invalid immutable {key} model revision metadata.")
     downloader = r"""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -453,7 +454,18 @@ for metadata in sorted(snapshot.rglob("*.json")):
         try:
             json.loads(repaired.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise SystemExit(f"Hub metadata remains invalid after repair: {relative}") from error
+            try:
+                damaged = repaired.read_bytes()
+                details = (
+                    f"size={len(damaged)}, "
+                    f"sha256={hashlib.sha256(damaged).hexdigest()}, "
+                    f"prefix={damaged[:80]!r}"
+                )
+            except OSError as detail_error:
+                details = f"unreadable ({detail_error.__class__.__name__})"
+            raise SystemExit(
+                f"Hub metadata remains invalid after HTTPS repair: {relative}; {details}"
+            ) from error
 
 root_config = snapshot / "config.json"
 if not root_config.is_file():
@@ -527,6 +539,10 @@ def _run_locked(
         "HF_HOME": str(work_root / "huggingface"),
         "HF_HUB_CACHE": str(work_root / "huggingface" / "hub"),
         "HF_HUB_DISABLE_TELEMETRY": "1",
+        # Kaggle has intermittently returned corrupt tiny metadata through the
+        # hf-xet path. This is set before each Hub subprocess imports the
+        # library, so force_download repairs use its regular HTTPS backend.
+        "HF_HUB_DISABLE_XET": "1",
         "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
     })
     python = ensure_venv(repo_root, work_root, child_env)

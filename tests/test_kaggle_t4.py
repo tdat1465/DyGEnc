@@ -201,6 +201,8 @@ class KaggleT4Tests(unittest.TestCase):
             "exclusive_run_lock(run_dir)",
             "Repairing corrupt Hub cache metadata",
             "force_download=True",
+            '"HF_HUB_DISABLE_XET": "1"',
+            "Hub metadata remains invalid after HTTPS repair",
         ):
             self.assertIn(name, source)
 
