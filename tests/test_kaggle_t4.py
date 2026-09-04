@@ -135,6 +135,17 @@ class KaggleT4Tests(unittest.TestCase):
         self.assertNotIn("PIP_INDEX_URL", environment)
         self.assertNotIn("PYTHONPATH", environment)
 
+    def test_venv_bypasses_kaggle_ensurepip(self):
+        repo = Path(__file__).resolve().parents[1]
+        work = self.root / "work"
+        with mock.patch.object(kaggle, "_run", return_value=mock.Mock(stdout="")) as run:
+            python = kaggle.ensure_venv(repo, work, {"SAFE": "1"})
+        create_command = run.call_args_list[0].args[0]
+        self.assertEqual(create_command[:3], [sys.executable, "-m", "venv"])
+        self.assertIn("--system-site-packages", create_command)
+        self.assertIn("--without-pip", create_command)
+        self.assertEqual(python, work / "venv-no-ensurepip-v1" / "bin" / "python")
+
     @unittest.skipUnless(
         sys.platform.startswith("linux") and importlib.util.find_spec("fcntl"),
         "flock contention test requires Linux",

@@ -128,7 +128,8 @@ print("Checkpoint:", RUN_DIR / "last.pth")
 
 Lần đầu có thể lâu vì launcher phải:
 
-1. tạo venv dùng lại Torch CUDA có sẵn của Kaggle;
+1. tạo venv bằng `--without-pip`, rồi dùng lại Torch CUDA và pip hệ thống của
+   Kaggle (không gọi bootstrap `ensurepip`);
 2. cài đúng wheel `torch_scatter==2.1.2+pt210cu128` từ PyG;
 3. hash bốn input lớn và tải hai model ở revision bất biến;
 4. unpickle từng scene-graph split nhưng chỉ encode/lưu 8 video đã chọn;
@@ -233,6 +234,9 @@ cậy; không thay input bằng file `.pkl` ngẫu nhiên.
 ## Lỗi thường gặp
 
 - `Missing HF_TOKEN`: chưa tạo/bật quyền Kaggle Secret hoặc sai tên secret.
+- Lỗi có dòng `ensurepip --upgrade --default-pip`: notebook đang dùng commit cũ;
+  fetch lại branch rồi chạy lại cell. Bản hiện tại dùng thư mục
+  `venv-no-ensurepip-v1` nên không cần xóa `RUN_DIR` hay checkpoint.
 - `401/403` khi tải Llama: tài khoản chứa token chưa được Meta cấp quyền model.
 - Sai Torch/Python: Kaggle đã đổi image. Không ép cài wheel cũ; cần cập nhật
   branch và PyG wheel đồng bộ trước.

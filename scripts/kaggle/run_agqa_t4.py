@@ -332,14 +332,26 @@ def _run(command: list[str], *, env: dict[str, str], cwd: Path | None = None,
 
 
 def ensure_venv(repo_root: Path, work_root: Path, child_env: dict[str, str]) -> Path:
-    venv = work_root / "venv"
+    # Kaggle's managed Python can expose pip through system-site-packages while
+    # its bundled ensurepip bootstrap is unavailable/broken.  --without-pip
+    # avoids that bootstrap; `venv/bin/python -m pip` then uses the system pip
+    # module but installs packages into this venv's own prefix.
+    venv = work_root / "venv-no-ensurepip-v1"
     python = venv / "bin" / "python"
     if not python.is_file():
         venv.parent.mkdir(parents=True, exist_ok=True)
         _run(
-            [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+            [sys.executable, "-m", "venv", "--system-site-packages",
+             "--without-pip", str(venv)],
             env=child_env,
         )
+    try:
+        _run([str(python), "-m", "pip", "--version"], env=child_env, capture=True)
+    except subprocess.CalledProcessError as error:
+        raise KaggleSetupError(
+            "The no-ensurepip venv cannot import Kaggle's system pip. "
+            "Start a new Kaggle session or use a new --work-root."
+        ) from error
     requirements = repo_root / "requirements-kaggle.txt"
     _run(
         [str(python), "-m", "pip", "--isolated", "install", "--no-cache-dir",
