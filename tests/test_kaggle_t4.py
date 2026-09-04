@@ -146,6 +146,79 @@ class KaggleT4Tests(unittest.TestCase):
         self.assertIn("--without-pip", create_command)
         self.assertEqual(python, work / "venv-no-ensurepip-v1" / "bin" / "python")
 
+    def test_embedded_model_downloader_compiles(self):
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        revisions = {
+            "llm": {"repo_id": kaggle.LLM_REPO, "revision": "a" * 40},
+            "mbert": {"repo_id": kaggle.MBERT_REPO, "revision": "b" * 40},
+        }
+        (run_dir / "model-revisions.json").write_text(
+            json.dumps(revisions), encoding="utf-8",
+        )
+        with mock.patch.object(kaggle, "_run") as run:
+            result = kaggle.resolve_and_download_models(
+                Path("python"), run_dir, {"HF_TOKEN": "not-a-real-token"}, "fresh",
+            )
+        self.assertEqual(result, revisions)
+        downloader_commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len(downloader_commands), 2)
+        for command in downloader_commands:
+            self.assertEqual(command[:2], ["python", "-c"])
+            compile(command[2], "<embedded-model-downloader>", "exec")
+
+    def test_embedded_downloader_atomically_repairs_empty_json(self):
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        revision = "b" * 40
+        revisions = {
+            "llm": {"repo_id": kaggle.LLM_REPO, "revision": "a" * 40},
+            "mbert": {"repo_id": kaggle.MBERT_REPO, "revision": revision},
+        }
+        (run_dir / "model-revisions.json").write_text(
+            json.dumps(revisions), encoding="utf-8",
+        )
+        with mock.patch.object(kaggle, "_run") as run:
+            kaggle.resolve_and_download_models(
+                Path("python"), run_dir, {"HF_TOKEN": "not-a-real-token"}, "fresh",
+            )
+        downloader = run.call_args_list[0].args[0][2]
+
+        cache_root = self.root / "hub"
+        snapshot = (
+            cache_root / "models--answerdotai--ModernBERT-large"
+            / "snapshots" / revision
+        )
+        snapshot.mkdir(parents=True)
+        config = snapshot / "config.json"
+        config.write_bytes(b"")
+        payload = b'{"model_type":"modernbert"}'
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status_code = 200
+        response.headers = {
+            "Content-Type": "application/json",
+            "X-Repo-Commit": revision,
+        }
+        response.iter_content.return_value = [payload]
+
+        with mock.patch.dict(os.environ, {
+            "HF_TOKEN": "not-a-real-token",
+            "HF_HUB_CACHE": str(cache_root),
+        }), mock.patch.object(
+            sys, "argv", ["downloader", kaggle.MBERT_REPO, revision],
+        ), mock.patch(
+            "huggingface_hub.snapshot_download", return_value=str(snapshot),
+        ), mock.patch(
+            "huggingface_hub.hf_hub_url", return_value="https://example.test/config.json",
+        ), mock.patch(
+            "huggingface_hub.utils.build_hf_headers", return_value={"user-agent": "test"},
+        ), mock.patch("requests.get", return_value=response):
+            exec(compile(downloader, "<embedded-model-downloader>", "exec"), {})
+
+        self.assertEqual(config.read_bytes(), payload)
+        response.raise_for_status.assert_called_once_with()
+
     @unittest.skipUnless(
         sys.platform.startswith("linux") and importlib.util.find_spec("fcntl"),
         "flock contention test requires Linux",
@@ -199,10 +272,10 @@ class KaggleT4Tests(unittest.TestCase):
             "torch_scatter==2.1.2+pt210cu128",
             "torch-2.10.0+cu128.html",
             "exclusive_run_lock(run_dir)",
-            "Repairing corrupt Hub cache metadata",
-            "force_download=True",
-            '"HF_HUB_DISABLE_XET": "1"',
-            "Hub metadata remains invalid after HTTPS repair",
+            "Repairing corrupt Hub cache metadata over direct HTTPS",
+            "requests.get(",
+            "os.replace(staged, target)",
+            "Hub metadata remains invalid after atomic repair",
         ):
             self.assertIn(name, source)
 

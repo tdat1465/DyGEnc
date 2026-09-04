@@ -429,7 +429,11 @@ import json
 import os
 from pathlib import Path
 import sys
-from huggingface_hub import hf_hub_download, snapshot_download
+import tempfile
+
+import requests
+from huggingface_hub import hf_hub_url, snapshot_download
+from huggingface_hub.utils import build_hf_headers
 token = os.environ.get("HF_TOKEN")
 if not token:
     raise SystemExit("Missing HF_TOKEN; enable the Kaggle Secret for this notebook")
@@ -439,32 +443,141 @@ snapshot = Path(snapshot_download(
 ))
 
 # A killed/failed Hub transfer can occasionally leave a corrupt content blob
-# that a later snapshot lookup regards as cached. Validate every JSON metadata
-# file before going offline and force-download only the damaged object.
+# that a later snapshot lookup regards as cached. huggingface_hub 0.35.x also
+# treats an erroneous HEAD Content-Length: 0 as a completed empty download, so
+# force_download can reproduce the same zero-byte blob without issuing a GET.
+# Validate every JSON file and repair only damaged metadata with an explicit
+# authenticated GET that does not rely on the HEAD-reported length.
 for metadata in sorted(snapshot.rglob("*.json")):
     try:
         json.loads(metadata.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         relative = metadata.relative_to(snapshot).as_posix()
-        print(f"Repairing corrupt Hub cache metadata: {sys.argv[1]}/{relative}", flush=True)
-        repaired = Path(hf_hub_download(
-            repo_id=sys.argv[1], filename=relative, revision=sys.argv[2],
-            token=token, force_download=True,
-        ))
+        print(
+            f"Repairing corrupt Hub cache metadata over direct HTTPS: "
+            f"{sys.argv[1]}/{relative}",
+            flush=True,
+        )
+
+        cache_root = Path(os.environ["HF_HUB_CACHE"]).resolve()
+        repo_cache = snapshot.parent.parent.resolve()
         try:
-            json.loads(repaired.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            try:
-                damaged = repaired.read_bytes()
-                details = (
-                    f"size={len(damaged)}, "
-                    f"sha256={hashlib.sha256(damaged).hexdigest()}, "
-                    f"prefix={damaged[:80]!r}"
+            repo_cache.relative_to(cache_root)
+        except ValueError:
+            raise SystemExit(f"Unexpected Hugging Face cache path for {relative}")
+
+        if metadata.is_symlink():
+            target = metadata.resolve()
+            blobs = (repo_cache / "blobs").resolve()
+            if target.parent != blobs:
+                raise SystemExit(
+                    f"Refusing to follow an unexpected Hub cache symlink: {relative}"
                 )
-            except OSError as detail_error:
-                details = f"unreadable ({detail_error.__class__.__name__})"
+        else:
+            target = metadata.resolve()
+            try:
+                target.relative_to(snapshot.resolve())
+            except ValueError:
+                raise SystemExit(
+                    f"Refusing to repair metadata outside its snapshot: {relative}"
+                )
+        if target.exists() and not target.is_file():
+            raise SystemExit(f"Hub metadata target is not a file: {relative}")
+
+        url = hf_hub_url(repo_id=sys.argv[1], filename=relative, revision=sys.argv[2])
+        headers = build_hf_headers(
+            token=token,
+            library_name="dygenc-kaggle-metadata-repair",
+            library_version="1.0",
+        )
+        headers.update({
+            "Accept-Encoding": "identity",
+            "Cache-Control": "no-cache, no-store",
+            "Pragma": "no-cache",
+        })
+        status = "unavailable"
+        content_type = "unknown"
+        served_revision = None
+        staged = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=target.parent,
+                prefix=f".{target.name}.dygenc-repair-",
+                delete=False,
+            ) as output:
+                staged = Path(output.name)
+                try:
+                    with requests.get(
+                        url,
+                        headers=headers,
+                        stream=True,
+                        allow_redirects=True,
+                        timeout=(15, 120),
+                    ) as response:
+                        status = response.status_code
+                        content_type = response.headers.get("Content-Type", "unknown")
+                        served_revision = response.headers.get("X-Repo-Commit")
+                        response.raise_for_status()
+                        received = 0
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            received += len(chunk)
+                            if received > 64 * 1024 * 1024:
+                                raise SystemExit(
+                                    f"Direct HTTPS metadata repair exceeded 64 MiB: {relative}"
+                                )
+                            output.write(chunk)
+                except requests.RequestException as request_error:
+                    status = getattr(request_error.response, "status_code", status)
+                    raise SystemExit(
+                        f"Direct HTTPS metadata repair failed: {relative}; "
+                        f"status={status}, error={request_error.__class__.__name__}"
+                    )
+                output.flush()
+                os.fsync(output.fileno())
+
+            payload = staged.read_bytes()
+            details = (
+                f"size={len(payload)}, "
+                f"sha256={hashlib.sha256(payload).hexdigest()}, "
+                f"prefix={payload[:80]!r}"
+            )
+            try:
+                parsed = json.loads(payload.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise SystemExit(
+                    f"Direct HTTPS metadata repair returned invalid JSON: {relative}; "
+                    f"status={status}, content_type={content_type}, {details}"
+                ) from error
+            if served_revision is not None and served_revision != sys.argv[2]:
+                raise SystemExit(
+                    f"Direct HTTPS metadata repair returned the wrong revision: {relative}"
+                )
+            expected_model_types = {
+                "answerdotai/ModernBERT-large": "modernbert",
+                "meta-llama/Llama-3.2-3B": "llama",
+            }
+            expected_model_type = expected_model_types.get(sys.argv[1])
+            if relative == "config.json" and (
+                not isinstance(parsed, dict)
+                or parsed.get("model_type") != expected_model_type
+            ):
+                raise SystemExit(
+                    f"Direct HTTPS metadata repair returned an unexpected model config: "
+                    f"{relative}; {details}"
+                )
+            os.replace(staged, target)
+        finally:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+
+        try:
+            json.loads(metadata.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise SystemExit(
-                f"Hub metadata remains invalid after HTTPS repair: {relative}; {details}"
+                f"Hub metadata remains invalid after atomic repair: {relative}; {details}"
             ) from error
 
 root_config = snapshot / "config.json"
@@ -539,10 +652,6 @@ def _run_locked(
         "HF_HOME": str(work_root / "huggingface"),
         "HF_HUB_CACHE": str(work_root / "huggingface" / "hub"),
         "HF_HUB_DISABLE_TELEMETRY": "1",
-        # Kaggle has intermittently returned corrupt tiny metadata through the
-        # hf-xet path. This is set before each Hub subprocess imports the
-        # library, so force_download repairs use its regular HTTPS backend.
-        "HF_HUB_DISABLE_XET": "1",
         "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
     })
     python = ensure_venv(repo_root, work_root, child_env)

@@ -239,11 +239,13 @@ cậy; không thay input bằng file `.pkl` ngẫu nhiên.
   `venv-no-ensurepip-v1` nên không cần xóa `RUN_DIR` hay checkpoint.
 - `401/403` khi tải Llama: tài khoản chứa token chưa được Meta cấp quyền model.
 - `config.json is not a valid JSON file`: metadata trong Hugging Face cache bị
-  hỏng sau một lần tải dở hoặc đường truyền hf-xet trả nội dung lỗi. Fetch
-  branch mới nhất rồi chạy lại; launcher buộc lần sửa dùng HTTPS thường, chỉ
-  force-download file JSON lỗi và giữ nguyên các weight đã tải thành công.
-  Nếu lỗi vẫn còn, gửi nguyên dòng `Hub metadata remains invalid after HTTPS
-  repair` (gồm size/hash/prefix an toàn, không chứa token) để chẩn đoán tiếp.
+  hỏng sau một lần tải dở hoặc proxy trả sai `Content-Length: 0` cho HEAD. Fetch
+  branch mới nhất rồi chạy lại. Khi Hub báo nhầm kích thước bằng 0,
+  launcher sẽ GET trực tiếp file tại đúng revision, xác minh JSON rồi thay thế
+  nguyên tử đúng blob lỗi; các weight đã tải thành công được giữ nguyên.
+  Nếu lỗi vẫn còn, gửi nguyên dòng `Direct HTTPS metadata repair...` hoặc `Hub
+  metadata remains invalid after atomic repair` (thông tin chẩn đoán không chứa
+  token) để kiểm tra tiếp.
 - Sai Torch/Python: Kaggle đã đổi image. Không ép cài wheel cũ; cần cập nhật
   branch và PyG wheel đồng bộ trước.
 - `Expected exactly one ... below ...`: dataset mount thiếu file hoặc chứa bản
