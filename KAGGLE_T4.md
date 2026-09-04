@@ -238,6 +238,9 @@ cậy; không thay input bằng file `.pkl` ngẫu nhiên.
   fetch lại branch rồi chạy lại cell. Bản hiện tại dùng thư mục
   `venv-no-ensurepip-v1` nên không cần xóa `RUN_DIR` hay checkpoint.
 - `401/403` khi tải Llama: tài khoản chứa token chưa được Meta cấp quyền model.
+- `config.json is not a valid JSON file`: metadata trong Hugging Face cache bị
+  hỏng sau một lần tải dở. Fetch branch mới nhất rồi chạy lại; launcher sẽ chỉ
+  force-download file JSON lỗi và giữ nguyên các weight đã tải thành công.
 - Sai Torch/Python: Kaggle đã đổi image. Không ép cài wheel cũ; cần cập nhật
   branch và PyG wheel đồng bộ trước.
 - `Expected exactly one ... below ...`: dataset mount thiếu file hoặc chứa bản

@@ -424,16 +424,40 @@ print(json.dumps({
         ):
             raise KaggleSetupError(f"Invalid immutable {key} model revision metadata.")
     downloader = r"""
+import json
 import os
+from pathlib import Path
 import sys
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 token = os.environ.get("HF_TOKEN")
 if not token:
     raise SystemExit("Missing HF_TOKEN; enable the Kaggle Secret for this notebook")
-snapshot_download(
+snapshot = Path(snapshot_download(
     repo_id=sys.argv[1], revision=sys.argv[2], token=token, max_workers=2,
     allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt", "*.tiktoken"],
-)
+))
+
+# A killed/failed Hub transfer can occasionally leave a corrupt content blob
+# that a later snapshot lookup regards as cached. Validate every JSON metadata
+# file before going offline and force-download only the damaged object.
+for metadata in sorted(snapshot.rglob("*.json")):
+    try:
+        json.loads(metadata.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        relative = metadata.relative_to(snapshot).as_posix()
+        print(f"Repairing corrupt Hub cache metadata: {sys.argv[1]}/{relative}", flush=True)
+        repaired = Path(hf_hub_download(
+            repo_id=sys.argv[1], filename=relative, revision=sys.argv[2],
+            token=token, force_download=True,
+        ))
+        try:
+            json.loads(repaired.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(f"Hub metadata remains invalid after repair: {relative}") from error
+
+root_config = snapshot / "config.json"
+if not root_config.is_file():
+    raise SystemExit(f"Downloaded model snapshot has no config.json: {sys.argv[1]}")
 """
     for key in ("mbert", "llm"):
         print(f"Caching {key}: {revisions[key]['repo_id']} @ {revisions[key]['revision']}", flush=True)

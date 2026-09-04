@@ -199,6 +199,8 @@ class KaggleT4Tests(unittest.TestCase):
             "torch_scatter==2.1.2+pt210cu128",
             "torch-2.10.0+cu128.html",
             "exclusive_run_lock(run_dir)",
+            "Repairing corrupt Hub cache metadata",
+            "force_download=True",
         ):
             self.assertIn(name, source)
 
